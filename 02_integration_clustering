@@ -1,0 +1,133 @@
+## =============================================================================
+## 02_integration_clustering.R
+##
+## Integration of day 150 scRNA-seq and snRNA-seq data, clustering, cell-type
+## annotation, and removal of a low-quality cluster.
+##
+## Input : merged, filtered Seurat object from 01_QC/01_qc_sctk_sc_sn.R
+## Steps
+##   1. SCTransform normalization
+##   2. PCA (30 components)
+##   3. Harmony integration with sequencing modality (scRNA-seq vs snRNA-seq) as
+##      the only grouping variable (theta = 3); genotype is not corrected for
+##   4. UMAP, shared nearest-neighbour graph and clustering (30 Harmony dims,
+##      resolution 0.4)
+##   5. Cell-type annotation from canonical marker genes
+##   6. Removal of cluster 21 (low-complexity nuclei with a ribosomal /
+##      mitochondrial stress signature)
+##
+## Output: annotated Seurat object used in 03_composition/ and
+##         04_OLLC_subclustering/
+## =============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(harmony)
+  library(dplyr)
+  library(ggplot2)
+  library(AnnotationDbi)
+  library(org.Hs.eg.db)
+})
+
+## -----------------------------------------------------------------------------
+## 0. Settings -- edit these paths
+## -----------------------------------------------------------------------------
+in_file  <- "/path/to/output/day150_merged_filtered_seurat.rds"   # from 01_QC
+out_dir  <- "/path/to/output"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+N_PCS      <- 30
+THETA      <- 3
+RESOLUTION <- 0.4
+set.seed(123456)
+
+merged <- readRDS(in_file)
+
+## -----------------------------------------------------------------------------
+## 1-2. SCTransform and PCA
+## -----------------------------------------------------------------------------
+merged <- SCTransform(merged, verbose = FALSE)
+merged <- RunPCA(merged, npcs = N_PCS, verbose = FALSE)
+
+## -----------------------------------------------------------------------------
+## 3. Harmony integration across sequencing modality
+## -----------------------------------------------------------------------------
+merged <- RunHarmony(merged, group.by.vars = "dataset", theta = THETA,
+                     reduction.use = "pca", dims.use = 1:N_PCS,
+                     reduction.save = "harmony")
+
+## -----------------------------------------------------------------------------
+## 4. UMAP, neighbours, clustering
+## -----------------------------------------------------------------------------
+merged <- RunUMAP(merged, reduction = "harmony", dims = 1:N_PCS)
+merged <- FindNeighbors(merged, reduction = "harmony", dims = 1:N_PCS)
+merged <- FindClusters(merged, resolution = RESOLUTION)
+
+print(table(merged$seurat_clusters, merged$dataset))
+
+## -----------------------------------------------------------------------------
+## 5. Cell-type annotation
+##    Clusters were annotated from canonical markers (gene symbols below;
+##    rownames are Ensembl IDs, so markers are mapped before plotting).
+## -----------------------------------------------------------------------------
+markers <- c(
+  ## excitatory neurons / cortical layers
+  "NEUROD2","NEUROD6","SNAP25","SATB2","CUX2","RORB","BCL11B","FEZF2",
+  ## inhibitory neurons
+  "GAD1","GAD2","DLX2",
+  ## RELN+ cells
+  "RELN",
+  ## progenitors / radial glia
+  "EOMES","VIM","SOX2","HES1","MKI67","TOP2A",
+  ## astrocytes
+  "SPARCL1","S100B","AQP4","GFAP",
+  ## oligodendrocyte lineage
+  "OLIG2","PDGFRA","ITPR2",
+  ## choroid plexus
+  "TTR")
+
+marker_ids <- mapIds(org.Hs.eg.db, keys = markers, keytype = "SYMBOL", column = "ENSEMBL", multiVals = "first")
+marker_ids <- marker_ids[!is.na(marker_ids) & marker_ids %in% rownames(merged)]
+
+DefaultAssay(merged) <- "RNA"
+merged <- NormalizeData(merged, verbose = FALSE)
+DotPlot(merged, features = unname(marker_ids), group.by = "seurat_clusters") +
+  scale_x_discrete(labels = setNames(names(marker_ids), marker_ids)) + RotatedAxis()
+
+## Cluster -> cell type (based on the clustering used in the paper)
+## NOTE: cluster numbers can change if clustering is rerun; check the dot plot
+##       before applying this mapping.
+cluster_to_celltype <- c(
+  "0"  = "ExN6",  "1"  = "ExN2",  "2"  = "RELN1", "3"  = "ExN7",
+  "4"  = "Astrocytes", "5" = "OLs",  "6"  = "ExN8",  "7"  = "RGC3",
+  "8"  = "ExN9",  "9"  = "ExN10", "10" = "RGC2",  "11" = "ExN5",
+  "12" = "IPC",   "13" = "ExN4",  "14" = "RELN2", "15" = "ExN1",
+  "16" = "RGC1",  "17" = "ExN3",  "18" = "InN1",  "19" = "InN3",
+  "20" = "InN2",  "21" = "ExN11", "22" = "Choroid plexus")
+
+merged$cell_type <- unname(cluster_to_celltype[as.character(merged$seurat_clusters)])
+print(table(merged$cell_type))
+
+## -----------------------------------------------------------------------------
+## 6. Remove cluster 21
+##    Cluster 21 consisted predominantly of low-complexity nuclei (median ~235
+##    genes) with high ribosomal and mitochondrial transcripts and no distinct
+##    cell-type markers, and was excluded.
+## -----------------------------------------------------------------------------
+merged@meta.data %>%
+  filter(seurat_clusters == "21") %>%
+  group_by(dataset) %>%
+  summarise(n = n(), median_genes = median(nFeature_RNA)) %>% print()
+
+Idents(merged) <- "seurat_clusters"
+merged <- subset(merged, idents = "21", invert = TRUE)
+merged$seurat_clusters <- droplevels(merged$seurat_clusters)
+
+cat("Cells after removing cluster 21:", ncol(merged), "\n")
+
+## Note: clusters 4 (astrocytes) and 5 (OLLCs) are refined after astroglial
+## subclustering in 04_OLLC_subclustering/.
+
+saveRDS(merged, file.path(out_dir, "day150_integrated_annotated_seurat.rds"))
+
+sessionInfo()
