@@ -1,0 +1,155 @@
+## =============================================================================
+## 05_celda_modules.R
+##
+## Celda co-clustering of OLLCs into cell states and gene modules.
+##
+## Input : integrated OLLC object from 04_OLLC_subclustering/
+## Steps
+##   1. Convert Seurat object to SingleCellExperiment (keep Harmony UMAP)
+##   2. Run celda_CG (min 5 cells per gene, min 5 counts, up to 5,000 genes,
+##      K = 30 cell states, L = 40 gene modules, genotype as sample label)
+##   3. Top-ranked genes per module (gene symbols)
+##   4. Module over- / under-expression per OLLC cluster (z-scored module
+##      scores, two-sided Wilcoxon, BH FDR < 0.05)
+##
+## Output: SCE with celda_CG results (written by reportCeldaCGRun), used in
+##         module enrichment, pseudotime and reference mapping
+## =============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SingleCellExperiment)
+  library(singleCellTK)
+  library(celda)
+  library(dplyr)
+  library(ggplot2)
+  library(tidytext)
+  library(AnnotationDbi)
+  library(org.Hs.eg.db)
+})
+
+## -----------------------------------------------------------------------------
+## 0. Settings -- edit these paths
+## -----------------------------------------------------------------------------
+in_file <- "/path/to/output/ollc_integrated.rds"   # from 04
+out_dir <- "/path/to/output"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+set.seed(123456)
+
+ollc <- readRDS(in_file)
+
+## -----------------------------------------------------------------------------
+## 1. Seurat -> SingleCellExperiment
+## -----------------------------------------------------------------------------
+Idents(ollc) <- "harmony_cellline_clusters"
+ollc[["RNA"]] <- as(ollc[["RNA"]], Class = "Assay")
+sce <- as.SingleCellExperiment(ollc)
+reducedDim(sce, "umap.harmony_cellline") <- Embeddings(ollc, "umap.harmony_cellline")
+
+## Gene symbols for interpretation
+sym <- mapIds(org.Hs.eg.db, keys = rownames(sce), keytype = "ENSEMBL",
+              column = "SYMBOL", multiVals = "first")
+rowData(sce)$gene_symbol <- unname(sym)
+
+## -----------------------------------------------------------------------------
+## 2. celda_CG
+## -----------------------------------------------------------------------------
+sce <- reportCeldaCGRun(
+  sce, useAssay = "counts",
+  minCell = 5, minCount = 5, maxFeatures = 5000,
+  K = 30, L = 40,
+  sampleLabel = sce$genotype,
+  output_dir = out_dir,
+  output_sce_prefix = "celda_ollc",
+  output_file = "CeldaCG_RunReport_ollc"
+)
+
+## Module and cell-state UMAPs (Celda selects top module genes automatically)
+reportCeldaCGPlotResults(
+  sce, useAssay = "counts",
+  reducedDimName = "umap.harmony_cellline",
+  features = NULL,
+  cellAnnot = c("genotype", "harmony_cellline_clusters"),
+  output_dir = out_dir,
+  output_file = "CeldaCG_ResultReport_ollc"
+)
+
+## -----------------------------------------------------------------------------
+## 3. Top genes per module
+## -----------------------------------------------------------------------------
+top_features <- topRank(sce, matrix = "features", n = 10)
+for (i in seq_along(top_features)) {
+  symbols <- rowData(sce)$gene_symbol[match(top_features[[i]], rownames(sce))]
+  cat("Module", i, "top genes:", paste(na.omit(symbols), collapse = ", "), "\n")
+}
+
+## -----------------------------------------------------------------------------
+## 4. Module over- / under-expression per OLLC cluster
+##    Per-cell module score = mean of gene-wise z-scored expression of module
+##    genes (modules with >= 3 genes). Two-sided Wilcoxon test, cluster vs all
+##    other cells; BH-adjusted FDR < 0.05.
+## -----------------------------------------------------------------------------
+MIN_GENES_PER_MODULE <- 3
+FDR_CUTOFF <- 0.05
+TOP_K <- 10
+
+## Gene modules from celda_CG (M1-M40)
+feat_sub    <- altExp(sce, "featureSubset")
+module_list <- split(rownames(feat_sub), paste0("M", celdaModules(sce, altExpName = "featureSubset")))
+module_list <- module_list[paste0("M", sort(unique(celdaModules(sce, altExpName = "featureSubset"))))]
+
+## Normalized expression, z-scored per gene
+ollc <- NormalizeData(ollc, verbose = FALSE)
+expr_mat <- GetAssayData(ollc, assay = "RNA", layer = "data")
+mu <- MatrixGenerics::rowMeans(expr_mat)
+sd <- sqrt(MatrixGenerics::rowVars(expr_mat)); sd[is.na(sd) | sd == 0] <- 1
+z_expr <- sweep(sweep(as.matrix(expr_mat), 1, mu, "-"), 1, sd, "/")
+
+## Module score per cell
+module_list <- module_list[vapply(module_list, function(g) sum(g %in% rownames(z_expr)) >= MIN_GENES_PER_MODULE, logical(1))]
+mod_by_cell <- do.call(rbind, lapply(module_list, function(g)
+  colMeans(z_expr[intersect(g, rownames(z_expr)), , drop = FALSE])))
+
+## Wilcoxon test per module and cluster
+clusters <- factor(ollc$harmony_cellline_clusters)
+module_tests <- bind_rows(lapply(levels(clusters), function(cl) {
+  in_c <- clusters == cl
+  tibble(
+    cluster = cl,
+    module  = rownames(mod_by_cell),
+    mean_in_cluster = rowMeans(mod_by_cell[, in_c, drop = FALSE]),
+    mean_outside    = rowMeans(mod_by_cell[, !in_c, drop = FALSE]),
+    p_value = apply(mod_by_cell, 1, function(x) wilcox.test(x[in_c], x[!in_c])$p.value)
+  ) %>%
+    mutate(mean_diff = mean_in_cluster - mean_outside,
+           fdr = p.adjust(p_value, method = "BH"),
+           direction = ifelse(mean_diff > 0, "Over-expressed", "Under-expressed"))
+}))
+
+top_over <- module_tests %>%
+  filter(fdr < FDR_CUTOFF, mean_diff > 0) %>%
+  group_by(cluster) %>% slice_max(mean_diff, n = TOP_K) %>% ungroup()
+top_under <- module_tests %>%
+  filter(fdr < FDR_CUTOFF, mean_diff < 0) %>%
+  group_by(cluster) %>% slice_min(mean_diff, n = TOP_K) %>% ungroup()
+print(top_over,  n = Inf)
+print(top_under, n = Inf)
+
+ggplot(top_over, aes(x = tidytext::reorder_within(module, -mean_diff, cluster),
+                     y = mean_diff, fill = cluster)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~cluster, scales = "free") +
+  tidytext::scale_x_reordered() +
+  labs(x = "Module", y = "Over-expression (delta mean score)") +
+  theme_bw(base_size = 12) + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggplot(top_under, aes(x = tidytext::reorder_within(module, mean_diff, cluster),
+                      y = -mean_diff, fill = cluster)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~cluster, scales = "free") +
+  tidytext::scale_x_reordered() +
+  labs(x = "Module", y = "Under-expression (-delta mean score)") +
+  theme_bw(base_size = 12) + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+sessionInfo()
