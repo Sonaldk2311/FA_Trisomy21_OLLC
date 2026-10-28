@@ -1,0 +1,398 @@
+## =============================================================================
+## 06_pseudotime.R
+##
+## Slingshot trajectory inference in OLLCs, gene expression along lineages and
+## fate-conflict plots of Celda module categories.
+##
+## Input : integrated OLLC object from 04_OLLC_subclustering/
+##         Celda module table (module_features.csv) from 05_celda_modules/
+## Steps
+##   1. Slingshot on the OLLC Harmony UMAP, OLLC clusters as input partition,
+##      start cluster = OLLC_4
+##        Lineage 1 (trisomic-ending): 4 -> 1 -> 5 -> 3
+##        Lineage 2 (euploid-ending) : 4 -> 1 -> 0 -> 2
+##   2. Pseudotime by genotype (per lineage; Wilcoxon) and pseudotime bins
+##   3. Lineage figures: UMAP with lineage curve + pseudotime violin by genotype
+##   4. Gene expression along pseudotime (GAM) and on the UMAP with lineage
+##      curves (solid = trisomic-ending, dashed = euploid-ending)
+##   5. Fate-conflict plots: aggregate Celda module category scores along the
+##      two lineages
+##
+## Output: OLLC object with pseudotime columns (used in 09_reference_comparison/)
+## =============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SingleCellExperiment)
+  library(slingshot)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(purrr)
+  library(readr)
+  library(stringr)
+  library(ggplot2)
+  library(ggpubr)
+  library(ggforce)
+  library(ggnewscale)
+  library(viridis)
+  library(scales)
+  library(patchwork)
+  library(RColorBrewer)
+  library(FNN)
+  library(mgcv)
+  library(AnnotationDbi)
+  library(org.Hs.eg.db)
+})
+
+## -----------------------------------------------------------------------------
+## 0. Settings -- edit these paths
+## -----------------------------------------------------------------------------
+in_file     <- "/path/to/output/ollc_integrated.rds"        # from 04
+module_file <- "/path/to/output/module_features.csv"        # Celda modules (tab-separated, L1-L40)
+out_dir     <- "/path/to/output"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+set.seed(123456)
+
+obj <- readRDS(in_file)
+
+root_lab       <- 4                          # forced start cluster (OLLC_4)
+reduction_name <- "umap.harmony_cellline"
+cluster_col    <- "harmony_cellline_clusters"
+group_col      <- "genotype"
+root_tag       <- paste0("root", root_lab)
+
+Idents(obj) <- cluster_col
+
+## =============================================================================
+## 1. Slingshot
+## =============================================================================
+emb_mat <- Embeddings(obj, reduction = reduction_name)
+sce <- SingleCellExperiment(assays = list(counts = GetAssayData(obj, layer = "counts")),
+                            colData = obj@meta.data)
+reducedDims(sce)[[toupper(reduction_name)]] <- emb_mat
+sce[[cluster_col]] <- factor(as.character(sce[[cluster_col]]))
+
+sce <- slingshot(sce, clusterLabels = cluster_col,
+                 reducedDim = toupper(reduction_name), start.clus = as.character(root_lab))
+
+pt_mat <- slingPseudotime(sce); curves <- slingCurves(sce); w_mat <- slingCurveWeights(sce)
+lin_names <- names(curves)
+if (is.null(lin_names) || any(lin_names == "")) {
+  lin_names <- paste0("Lineage", seq_along(curves)); names(curves) <- lin_names
+}
+colnames(pt_mat) <- lin_names; colnames(w_mat) <- lin_names
+
+ll <- slingLineages(sce)
+cat(sprintf("Root = %s | %d lineage(s):\n", root_lab, length(curves)))
+for (i in seq_along(ll)) cat(sprintf("  %s: %s\n", lin_names[i], paste(ll[[i]], collapse = " -> ")))
+
+emb <- reducedDims(sce)[[toupper(reduction_name)]]
+
+## All lineages on the UMAP
+plot(emb, pch = 16, col = "grey80", asp = 1, main = sprintf("All lineages (root = %s)", root_lab))
+lines(SlingshotDataSet(sce), lwd = 2, col = "black")
+
+## Dominant lineage per cell; overall pseudotime = minimum across lineages
+lin_assign <- apply(w_mat, 1, function(x)
+  if (all(is.na(x)) || max(x, na.rm = TRUE) == 0) NA_character_ else lin_names[which.max(x)])
+pt_min <- apply(pt_mat, 1, function(x) if (all(is.na(x))) NA_real_ else min(x, na.rm = TRUE))
+
+obj[[paste0("pseudotime_", root_tag, "_min")]] <- pt_min
+for (i in seq_along(lin_names)) obj[[paste0("pseudotime_", root_tag, "_", lin_names[i])]] <- pt_mat[, i]
+obj[[paste0("lineage_assign_", root_tag)]] <- lin_assign
+
+FeaturePlot(obj, features = c(paste0("pseudotime_", root_tag, "_min"),
+                              paste0("pseudotime_", root_tag, "_", lin_names[1:2])),
+            reduction = reduction_name, ncol = 3)
+
+## =============================================================================
+## 2. Pseudotime by genotype
+## =============================================================================
+geno_vec <- as.character(obj@meta.data[[group_col]])
+
+df_pt <- data.frame(Cell = colnames(sce), genotype = geno_vec, pt_mat, check.names = FALSE) |>
+  pivot_longer(cols = all_of(lin_names), names_to = "Lineage", values_to = "Pseudotime") |>
+  filter(!is.na(genotype), !is.na(Pseudotime))
+
+ggplot(df_pt, aes(genotype, Pseudotime, fill = genotype)) +
+  geom_violin(trim = FALSE, alpha = 0.7) +
+  geom_boxplot(width = 0.1, outlier.shape = NA, alpha = 0.4) +
+  stat_compare_means(method = "wilcox.test", label = "p.format",
+                     comparisons = list(c("euploid", "trisomic"))) +
+  facet_wrap(~ Lineage, scales = "free_y") +
+  theme_classic() + theme(legend.position = "none") +
+  labs(title = sprintf("Pseudotime by lineage & genotype (root = %s)", root_lab), x = NULL, y = "Pseudotime")
+
+df_bins <- data.frame(genotype = geno_vec, Pseudotime = pt_min) |>
+  filter(!is.na(genotype), !is.na(Pseudotime)) |>
+  mutate(bin = cut(Pseudotime, breaks = quantile(Pseudotime, seq(0, 1, 0.25), na.rm = TRUE),
+                   include.lowest = TRUE))
+print(table(df_bins$bin, df_bins$genotype))
+print(round(prop.table(table(df_bins$bin, df_bins$genotype), 1), 3))
+
+## =============================================================================
+## 3. Lineage figures: UMAP with lineage curve + pseudotime violin by genotype
+##    Lineage 1 = trisomic-ending, Lineage 2 = euploid-ending
+## =============================================================================
+violin_fill   <- c("euploid" = "#003366", "trisomic" = "#CE4446")
+violin_border <- c("euploid" = "#1C3753", "trisomic" = "#B45354")
+box_fill      <- c("euploid" = "#326496", "trisomic" = "#660000")
+box_border    <- c("euploid" = "#1C3753", "trisomic" = "#B45354")
+
+lineage_figure <- function(lineage_i, title) {
+  emb_df <- as.data.frame(emb)
+  colnames(emb_df) <- c("UMAP_1", "UMAP_2")
+
+  crv <- curves[[lineage_i]]
+  curve_df <- as.data.frame(crv$s[crv$ord, 1:2])
+  colnames(curve_df) <- c("UMAP_1", "UMAP_2")
+
+  ## trim curve points far from any cell (> 90th percentile of distance)
+  nn <- get.knnx(data = emb_df[, c("UMAP_1", "UMAP_2")],
+                 query = curve_df[, c("UMAP_1", "UMAP_2")], k = 1)
+  curve_df$dist_to_cell <- nn$nn.dist[, 1]
+  curve_df <- curve_df[curve_df$dist_to_cell <= quantile(curve_df$dist_to_cell, 0.90), ]
+  curve_df$position <- seq_len(nrow(curve_df))
+
+  p_umap <- ggplot() +
+    geom_point(data = emb_df, aes(UMAP_1, UMAP_2), color = "grey85", size = 0.6) +
+    geom_link2(data = curve_df, aes(UMAP_1, UMAP_2, color = position, group = 1),
+               linewidth = 1.8, lineend = "round", n = 500) +
+    scale_color_viridis(option = "inferno", direction = -1, name = "Pseudotime") +
+    theme_void() +
+    theme(legend.position = "right", plot.title = element_text(hjust = 0.5)) +
+    labs(title = title)
+
+  df_lin <- data.frame(Cell = colnames(sce), genotype = geno_vec,
+                       Pseudotime = pt_mat[, lineage_i]) |>
+    filter(!is.na(genotype), !is.na(Pseudotime)) |>
+    mutate(genotype = factor(genotype, levels = c("euploid", "trisomic")))
+
+  p_violin <- ggplot(df_lin, aes(genotype, Pseudotime)) +
+    geom_violin(aes(fill = genotype, color = genotype), trim = FALSE, linewidth = 0.9) +
+    scale_fill_manual(values = alpha(violin_fill, 0.85)) +
+    scale_color_manual(values = violin_border) +
+    new_scale_fill() +
+    new_scale_color() +
+    geom_boxplot(aes(fill = genotype, color = genotype), width = 0.12, outlier.shape = NA, linewidth = 0.9) +
+    scale_fill_manual(values = alpha(box_fill, 0.85)) +
+    scale_color_manual(values = box_border) +
+    stat_compare_means(method = "wilcox.test", label = "p.format",
+                       comparisons = list(c("euploid", "trisomic")), size = 5) +
+    scale_x_discrete(labels = c("euploid" = "Euploid", "trisomic" = "Trisomic")) +
+    theme_classic(base_size = 16) +
+    theme(legend.position = "none", axis.title.x = element_blank()) +
+    labs(y = "Pseudotime")
+
+  p_umap + p_violin + plot_layout(widths = c(1.1, 1))
+}
+
+lineage_figure(1, "Trisomic Ending Lineage")
+lineage_figure(2, "Euploid Ending Lineage")
+
+## =============================================================================
+## 4. Gene expression along pseudotime and on the UMAP
+## =============================================================================
+ollc <- obj
+WEIGHT_THRESHOLD     <- 0.1
+LINEAGES_OF_INTEREST <- c("Lineage1", "Lineage2")
+lin_colours <- setNames(brewer.pal(3, "Set1")[1:2], LINEAGES_OF_INTEREST)
+
+GENES_OF_INTEREST <- unique(c(
+  "LINGO1","BCAS1","SPARCL1","PDGFRA","MBP","APC","PLP1","SOX10","GPR17",
+  "MKI67","OLIG2","CNP","GPC1","ITPR2","RTN4","NRG1","ERBB4","TMEM10",
+  "MAL","CLDN11","CNTN1","QKI","UGT8","NFASC","TNC","ENPP6","TCF7L2",
+  "ADGRL3","CADM2","GRID2","LHFPL3","FRMD5","MDGA2",
+  "NTM","SGCD","DNM3","GALNT13","NXPH1","PCDH15","XKR4",
+  "SOX9","GLI3","SMC3","RAD21","MYBL2","MYBL1","E2F7","BRCA1",
+  "ZEB1","SOX5","SMAD3","ETV5","SOX6","SOX4","E2F3",
+  "SOX2","MYRF","NKX6-2","SOX8","HDAC8",
+  "NRXN1","NRXN2","NRXN3","NLGN1","NLGN2","NLGN3","NLGN4X","NLGN4Y",
+  "GRIA4","GRIA2","PTPRZ1","CSPG4","SERPINC5","PMP22","MOG","KLK6","APOD","SLC1A3"
+))
+
+## Ensembl -> symbol
+all_ens       <- rownames(ollc)
+all_ens_clean <- sub("\\..*$", "", all_ens)
+sym_map <- AnnotationDbi::select(org.Hs.eg.db, keys = all_ens_clean,
+                                 columns = c("ENSEMBL", "SYMBOL"), keytype = "ENSEMBL") |>
+  dplyr::filter(!duplicated(ENSEMBL), !is.na(SYMBOL))
+genes_found <- GENES_OF_INTEREST[GENES_OF_INTEREST %in% sym_map$SYMBOL]
+sym2ens <- setNames(all_ens[match(sym_map$ENSEMBL[match(genes_found, sym_map$SYMBOL)], all_ens_clean)],
+                    genes_found)
+sym2ens   <- sym2ens[!is.na(sym2ens)]
+genes_use <- names(sym2ens)
+
+## Expression of lineage cells (curve weight >= 0.1)
+expr_sub <- as.matrix(GetAssayData(ollc, layer = "data")[sym2ens[genes_use], , drop = FALSE])
+rownames(expr_sub) <- genes_use
+
+build_lineage_df <- function(lin) {
+  w <- w_mat[, lin]; pt <- pt_mat[, lin]
+  keep  <- !is.na(pt) & !is.na(w) & w >= WEIGHT_THRESHOLD
+  cells <- colnames(ollc)[keep]
+  mat   <- as.data.frame(t(expr_sub[, cells, drop = FALSE]))
+  mat$pseudotime <- pt[keep]; mat$lineage <- lin; mat$cell <- cells
+  mat
+}
+df_long <- lapply(LINEAGES_OF_INTEREST, build_lineage_df) |>
+  bind_rows() |>
+  pivot_longer(cols = all_of(genes_use), names_to = "gene", values_to = "expression")
+print(table(df_long[!duplicated(paste(df_long$cell, df_long$lineage)), "lineage"]))
+
+## UMAP data and lineage curves
+umap_all <- as.data.frame(Embeddings(ollc, reduction_name))
+colnames(umap_all) <- c("UMAP1", "UMAP2")
+umap_all <- rownames_to_column(umap_all, "cell")
+lin_cells <- unique(df_long$cell)
+
+curve_df <- bind_rows(lapply(LINEAGES_OF_INTEREST, function(lin) {
+  crv <- as.data.frame(curves[[lin]]$s)
+  colnames(crv) <- c("UMAP1", "UMAP2"); crv$lineage <- lin; crv
+}))
+umap_expr <- umap_all |>
+  filter(cell %in% lin_cells) |>
+  left_join(rownames_to_column(as.data.frame(t(expr_sub[, lin_cells, drop = FALSE])), "cell"), by = "cell")
+
+make_curve_plot <- function(g) {
+  ggplot(filter(df_long, gene == g), aes(x = pseudotime, y = expression, colour = lineage)) +
+    geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), se = TRUE, alpha = 0.15, linewidth = 1) +
+    scale_colour_manual(values = lin_colours, name = "Lineage") +
+    labs(title = g, x = "Pseudotime", y = "Normalised expression") +
+    theme_classic(base_size = 12) +
+    theme(plot.title = element_text(face = "italic", size = 14, hjust = 0.5), legend.position = "bottom")
+}
+
+make_umap_plot <- function(g) {
+  df_g <- umap_expr |> dplyr::select(cell, UMAP1, UMAP2, expr = all_of(g))
+  ggplot() +
+    geom_point(data = umap_all, aes(x = UMAP1, y = UMAP2), colour = "grey92", size = 0.2) +
+    geom_point(data = df_g, aes(x = UMAP1, y = UMAP2, colour = expr), size = 0.5) +
+    geom_path(data = curve_df, aes(x = UMAP1, y = UMAP2, group = lineage, linetype = lineage),
+              colour = "black", linewidth = 0.7) +
+    scale_colour_gradientn(colours = c("grey95", "#FED976", "#FC4E2A", "#800026"), name = "Expr") +
+    scale_linetype_manual(values = setNames(c("solid", "dashed"), LINEAGES_OF_INTEREST), name = "Lineage") +
+    labs(title = g) +
+    theme_void(base_size = 12) +
+    theme(plot.title = element_text(face = "italic", size = 14, hjust = 0.5), legend.position = "bottom")
+}
+
+for (g in genes_use) {
+  print(make_curve_plot(g))
+  print(make_umap_plot(g))
+}
+
+## =============================================================================
+## 5. Fate-conflict plots
+##    Per category: AddModuleScore per module (modules with >= 2 genes detected),
+##    mean across modules, scaled 0-1; pseudotime scaled 0-1 per lineage;
+##    GAM-smoothed curves for the two lineages.
+## =============================================================================
+pt_lin1_col   <- "pseudotime_root4_Lineage1"
+pt_lin2_col   <- "pseudotime_root4_Lineage2"
+lin1_clusters <- c("4", "1", "5", "3")
+lin2_clusters <- c("4", "1", "0", "2")
+
+raw_mod <- read_tsv(module_file, show_col_types = FALSE)
+module_gene_list <- lapply(names(raw_mod), function(col) {
+  ids <- raw_mod[[col]]; ids[!is.na(ids) & ids != ""]
+})
+names(module_gene_list) <- names(raw_mod)
+
+## Module categories (as in the OLLC_2 / OLLC_3 alluvial plots)
+unique_cat_defs <- list(
+  trophic              = list(name = "Trophic-Supportive & Homeostatic",       ollc = "OLLC_2", modules = c("L1", "L3", "L5", "L6")),
+  structural           = list(name = "Structural Maturity & Axon-Interaction", ollc = "OLLC_2", modules = c("L2", "L31", "L29")),
+  mito                 = list(name = "Mitochondrial OXPHOS",                   ollc = "OLLC_2", modules = c("L8", "L9", "L10")),
+  cellular_maintenance = list(name = "Cellular Maintenance, Proteostasis & Transcriptional Regulation",
+                                                                               ollc = "OLLC_2", modules = c("L4", "L18", "L20", "L22", "L32", "L30", "L37")),
+  oligo                = list(name = "OL differentiation & lineage progression", ollc = "OLLC_3", modules = c("L13", "L25")),
+  glutamatergic        = list(name = "Glutamatergic & synaptic signaling",     ollc = "OLLC_3", modules = c("L11", "L12", "L14", "L15", "L40")),
+  neuronglia           = list(name = "Neuron\u2013glia communication",         ollc = "OLLC_3", modules = c("L36", "L38", "L39")),
+  hypoxia              = list(name = "Hypoxia",                                ollc = "OLLC_3", modules = c("L27", "L28"))
+)
+stopifnot(all(unlist(lapply(unique_cat_defs, `[[`, "modules")) %in% names(module_gene_list)))
+
+## Score each category
+score_col_map <- list()
+for (def_key in names(unique_cat_defs)) {
+  def      <- unique_cat_defs[[def_key]]
+  gene_lst <- keep(module_gene_list[def$modules], ~ sum(.x %in% rownames(ollc)) >= 2)
+  score_col <- paste0("score_", def_key)
+  if (length(gene_lst) == 0) {
+    ollc@meta.data[[score_col]] <- NA_real_
+  } else {
+    prefix <- paste0("tmp_", def_key, "_")
+    ollc <- AddModuleScore(object = ollc, features = gene_lst, name = prefix)
+    tmp_cols <- paste0(prefix, seq_along(gene_lst))
+    ollc@meta.data[[score_col]] <- rowMeans(ollc@meta.data[, tmp_cols, drop = FALSE], na.rm = TRUE)
+    ollc@meta.data[, tmp_cols] <- NULL
+  }
+  score_col_map[[def_key]] <- score_col
+}
+
+scale01 <- function(x) {
+  r <- range(x, na.rm = TRUE)
+  if (diff(r) == 0 || all(is.na(x))) return(rep(NA_real_, length(x)))
+  (x - r[1]) / diff(r)
+}
+
+df_all <- data.frame(
+  cluster = as.character(ollc@meta.data[[cluster_col]]),
+  pt_lin1 = ollc@meta.data[[pt_lin1_col]],
+  pt_lin2 = ollc@meta.data[[pt_lin2_col]],
+  ollc@meta.data[, unlist(score_col_map), drop = FALSE],
+  stringsAsFactors = FALSE
+)
+df_lin1_base <- df_all |>
+  filter(cluster %in% lin1_clusters, !is.na(pt_lin1)) |>
+  mutate(pseudotime = scale01(pt_lin1), Lineage = "Lineage 1 \u2192 Cluster 3") |>
+  dplyr::select(-pt_lin1, -pt_lin2, -cluster)
+df_lin2_base <- df_all |>
+  filter(cluster %in% lin2_clusters, !is.na(pt_lin2)) |>
+  mutate(pseudotime = scale01(pt_lin2), Lineage = "Lineage 2 \u2192 Cluster 2") |>
+  dplyr::select(-pt_lin1, -pt_lin2, -cluster)
+
+fate_pal <- c("Lineage 1 \u2192 Cluster 3" = "#C74655", "Lineage 2 \u2192 Cluster 2" = "#4F81BD")
+fate_theme <- theme_classic(base_size = 14) +
+  theme(legend.position = c(0.82, 0.88), legend.background = element_blank(),
+        legend.text = element_text(size = 11), axis.title = element_text(size = 13),
+        axis.text = element_text(size = 12, color = "black"),
+        plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+        plot.margin = margin(12, 20, 12, 12))
+
+for (def_key in names(unique_cat_defs)) {
+  score_col <- score_col_map[[def_key]]
+  df_plot <- bind_rows(
+    df_lin1_base |> dplyr::select(pseudotime, Lineage, score = all_of(score_col)) |>
+      filter(!is.na(score)) |> mutate(score = scale01(score)),
+    df_lin2_base |> dplyr::select(pseudotime, Lineage, score = all_of(score_col)) |>
+      filter(!is.na(score)) |> mutate(score = scale01(score))
+  )
+  if (nrow(df_plot) < 20) next
+
+  print(
+    ggplot(df_plot, aes(x = pseudotime, y = score, color = Lineage, fill = Lineage)) +
+      geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs", k = 12),
+                  se = TRUE, linewidth = 1.6, alpha = 0.15) +
+      scale_color_manual(values = fate_pal) +
+      scale_fill_manual(values = fate_pal) +
+      scale_x_continuous(expand = c(0.01, 0), breaks = c(0, 0.25, 0.5, 0.75, 1),
+                         labels = c("0", "0.25", "0.5", "0.75", "1")) +
+      scale_y_continuous(limits = c(0, 1.05), breaks = c(0, 0.25, 0.5, 0.75, 1),
+                         labels = c("0", "0.25", "0.5", "0.75", "1")) +
+      labs(x = "Pseudotime  (normalised 0\u20131 per lineage)",
+           y = "Aggregate module score\n(scaled 0\u20131 per lineage)",
+           title = unique_cat_defs[[def_key]]$name, color = NULL, fill = NULL) +
+      fate_theme
+  )
+}
+
+## -----------------------------------------------------------------------------
+## Save OLLC object with pseudotime
+## -----------------------------------------------------------------------------
+saveRDS(obj, file.path(out_dir, "ollc_integrated_pseudotime.rds"))
+
+sessionInfo()
