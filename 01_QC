@@ -1,0 +1,110 @@
+## =============================================================================
+## 01_qc_sctk_sc_sn.R
+##
+## Quality control of day 150 forebrain assembloid (FA) scRNA-seq and snRNA-seq
+## data with the Single Cell Toolkit (SCTK).
+##
+##   scRNA-seq : 10x Chromium Single Cell 3' v3, Cell Ranger 7.2.0 (GRCh38-2024-A)
+##   snRNA-seq : 10x Multiome ATAC + Gene Expression, Cell Ranger ARC 2.0.1;
+##               only Gene Expression features are used
+##
+## Steps
+##   1. Import Cell Ranger filtered matrices (6 scRNA-seq + 6 snRNA-seq libraries)
+##   2. Run SCTK QC: QC metrics (incl. mitochondrial %), scDblFinder, DecontX
+##   3. Filter cells/nuclei:
+##        mitochondrial content  < 20%
+##        scDblFinder call       == "Singlet"
+##        DecontX contamination  < 0.8
+##   4. Convert to Seurat, add sample metadata, merge, and save
+##
+## Output: merged, filtered Seurat object used in 02_integration_clustering/
+## Note: scDblFinder and DecontX are stochastic; rerunning may change the calls
+##       for a small number (~2%) of borderline cells.
+## =============================================================================
+
+suppressPackageStartupMessages({
+  library(SingleCellExperiment)
+  library(DropletUtils)
+  library(singleCellTK)
+  library(Seurat)
+  library(dplyr)
+})
+
+## -----------------------------------------------------------------------------
+## 0. Settings -- edit these paths
+## -----------------------------------------------------------------------------
+sc_dir  <- "/path/to/Day150_scrnaseq"     # Cell Ranger output, one folder per sample
+sn_dir  <- "/path/to/Day150_Multiome"     # Cell Ranger ARC output, one folder per sample
+out_dir <- "/path/to/output"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+SEED <- 123456
+
+## Sample sheet: one row per library
+samples <- data.frame(
+  sample    = c("ZE_CN_sc11WCE","ZE_CN_sc12WCT","ZE_CN_sc13ME","ZE_CN_sc14MT","ZE_CN_sc15ILDE","ZE_CN_sc16ILDT",
+                "ZE_CN_5","ZE_CN_6","ZE_CN_7","ZE_CN_8","ZE_CN_9","ZE_CN_10b"),
+  dataset   = rep(c("sc_150", "sn_150"), each = 6),
+  cell_line = rep(c("WC","WC","M","M","ILD","ILD"), 2),      # M = DS1-iPS4
+  genotype  = rep(c("euploid","trisomic"), 6),
+  sex       = rep(c("female","female","male","male","female","female"), 2),
+  stringsAsFactors = FALSE
+)
+
+## -----------------------------------------------------------------------------
+## 1. Import Cell Ranger matrices
+## -----------------------------------------------------------------------------
+## scRNA-seq
+sc_list <- lapply(samples$sample[samples$dataset == "sc_150"], function(s)
+  importCellRanger(cellRangerDirs = sc_dir, sampleDirs = s))
+sce_sc  <- combineSCE(sc_list, by.r = NULL, by.c = NULL, combined = TRUE)
+
+## snRNA-seq (Multiome): keep Gene Expression features only
+read_multiome_gex <- function(s) {
+  sce <- read10xCounts(file.path(sn_dir, s, "outs", "filtered_feature_bc_matrix"),
+                       type = "sparse", row.names = "id", col.names = TRUE)
+  sce <- sce[rowData(sce)$Type == "Gene Expression", ]
+  sce$sample <- s
+  colnames(sce) <- paste(s, colnames(sce), sep = "_")
+  sce
+}
+sce_sn <- do.call(cbind, lapply(samples$sample[samples$dataset == "sn_150"], read_multiome_gex))
+
+## -----------------------------------------------------------------------------
+## 2. SCTK QC: QC metrics, doublets (scDblFinder), ambient RNA (DecontX)
+## -----------------------------------------------------------------------------
+sce_sc <- runCellQC(sce_sc, sample = NULL, algorithms = c("QCMetrics", "scDblFinder", "decontX"), seed = SEED)
+sce_sn <- runCellQC(sce_sn, sample = NULL, algorithms = c("QCMetrics", "scDblFinder", "decontX"), seed = SEED)
+
+## -----------------------------------------------------------------------------
+## 3. Filtering (same criteria for both modalities)
+## -----------------------------------------------------------------------------
+filter_cells <- function(sce) {
+  sce <- subsetSCECols(sce, colData = "mito_percent < 20")
+  sce <- subsetSCECols(sce, colData = 'scDblFinder_doublet_call == "Singlet"')
+  sce <- subsetSCECols(sce, colData = "decontX_contamination < 0.8")
+  sce
+}
+sce_sc_f <- filter_cells(sce_sc)
+sce_sn_f <- filter_cells(sce_sn)
+
+data.frame(dataset = c("scRNA-seq", "snRNA-seq"),
+           before  = c(ncol(sce_sc), ncol(sce_sn)),
+           after   = c(ncol(sce_sc_f), ncol(sce_sn_f)))
+
+## -----------------------------------------------------------------------------
+## 4. Convert to Seurat, add sample metadata, merge, save
+## -----------------------------------------------------------------------------
+to_seurat <- function(sce) {
+  so <- convertSCEToSeurat(sce, copyColData = TRUE, copyReducedDim = FALSE, copyDecontX = TRUE)
+  so$sample <- sce$sample
+  so
+}
+merged <- merge(to_seurat(sce_sc_f), y = to_seurat(sce_sn_f))
+
+meta   <- samples[match(merged$sample, samples$sample), c("dataset", "cell_line", "genotype", "sex")]
+merged <- AddMetaData(merged, metadata = data.frame(meta, row.names = colnames(merged)))
+
+saveRDS(merged, file.path(out_dir, "day150_merged_filtered_seurat.rds"))
+
+sessionInfo()
