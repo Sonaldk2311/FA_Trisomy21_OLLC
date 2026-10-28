@@ -1,0 +1,283 @@
+## =============================================================================
+## 04_OLLC_subclustering.R
+##
+## Subclustering of glial cells, refinement of the astrocyte / OLLC clusters,
+## and OLLC subclustering and characterization.
+##
+## Input : annotated Seurat object from 02_integration_clustering/
+## Steps
+##   1. Glial subclustering (clusters 4 and 5); removal of a mixed cluster
+##      (cluster 10; astrocyte markers high, OLLC markers low) and reclustering
+##   2. Refinement of clusters 4 (astrocytes) and 5 (OLLCs) in the full object
+##   3. OLLC subset: HVGs (top 5,000) per cell line x technology group,
+##      intersection across all six groups (1,155 genes)
+##   4. PCA on shared HVGs, Harmony (cell line + technology, 15 PCs), UMAP and
+##      clustering (resolution 0.4)
+##   5. Cluster composition, marker dot plot, cluster similarity dendrogram
+##   6. Cluster markers (Wilcoxon, shared HVGs) and top-10 marker heatmap
+##   7. Per-cluster GSEA (GO BP, gseGO) and lollipop plot
+##   8. Genotype enrichment per OLLC subcluster (Fisher's exact test) and
+##      volcano plot
+##
+## Output: refined full object (used in 03_composition/ and 08_cellchat/) and
+##         integrated OLLC object (used in 05-09)
+## =============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(harmony)
+  library(dplyr)
+  library(tibble)
+  library(purrr)
+  library(stringr)
+  library(forcats)
+  library(ggplot2)
+  library(ggrepel)
+  library(viridis)
+  library(AnnotationDbi)
+  library(org.Hs.eg.db)
+  library(clusterProfiler)
+})
+
+## -----------------------------------------------------------------------------
+## 0. Settings -- edit these paths
+## -----------------------------------------------------------------------------
+in_file <- "/path/to/output/day150_integrated_annotated_seurat.rds"   # from 02
+out_dir <- "/path/to/output"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+set.seed(123456)
+
+merged <- readRDS(in_file)
+
+## Helper: Ensembl ID -> gene symbol (keeps the Ensembl ID if no symbol)
+ens_to_symbol <- function(ids) {
+  sym <- mapIds(org.Hs.eg.db, keys = sub("\\..*$", "", ids),
+                column = "SYMBOL", keytype = "ENSEMBL", multiVals = "first")
+  ifelse(is.na(sym), ids, sym)
+}
+## Helper: gene symbols -> Ensembl IDs present in the object (keeps order)
+symbol_to_ens <- function(symbols, obj) {
+  ids <- mapIds(org.Hs.eg.db, keys = symbols, keytype = "SYMBOL",
+                column = "ENSEMBL", multiVals = "first")
+  ids[!is.na(ids) & ids %in% rownames(obj)]
+}
+
+## -----------------------------------------------------------------------------
+## 1. Glial subclustering (clusters 4 and 5)
+##    NOTE: confirm against the original glial subclustering code
+## -----------------------------------------------------------------------------
+glia <- subset(merged, subset = seurat_clusters %in% c("4", "5"))
+glia <- FindNeighbors(glia, reduction = "harmony", dims = 1:30)
+glia <- FindClusters(glia, resolution = 0.4)
+print(table(glia$seurat_clusters))             # 11 clusters (0-10)
+
+## Cluster 10: astrocyte markers high, OLLC markers low -> removed, recluster
+glia <- subset(glia, subset = seurat_clusters != "10")
+glia <- FindNeighbors(glia, reduction = "harmony", dims = 1:30)
+glia <- FindClusters(glia, resolution = 0.4)
+
+## -----------------------------------------------------------------------------
+## 2. Refine clusters 4 and 5 in the full object
+##    Glial subclusters 0, 6 and 7 (OLLC markers) -> cluster 5 (OLLCs);
+##    all other glial cells -> cluster 4 (astrocytes)
+## -----------------------------------------------------------------------------
+ollc_glia_clusters <- c("0", "6", "7")
+
+glia_cells <- colnames(glia)
+new_cl <- ifelse(as.character(glia$seurat_clusters) %in% ollc_glia_clusters, "5", "4")
+
+merged$seurat_clusters <- as.character(merged$seurat_clusters)
+merged$seurat_clusters[glia_cells] <- new_cl
+merged$seurat_clusters <- factor(merged$seurat_clusters,
+                                 levels = sort(as.numeric(unique(merged$seurat_clusters))))
+merged$cell_type[merged$seurat_clusters == "4"] <- "Astrocytes"
+merged$cell_type[merged$seurat_clusters == "5"] <- "OLLCs"
+Idents(merged) <- "seurat_clusters"
+
+saveRDS(merged, file.path(out_dir, "day150_final_annotated_seurat.rds"))
+
+## -----------------------------------------------------------------------------
+## 3. OLLC subset and shared highly variable genes
+## -----------------------------------------------------------------------------
+ollc <- subset(glia, cells = glia_cells[new_cl == "5"])
+DefaultAssay(ollc) <- "RNA"
+ollc <- JoinLayers(ollc)
+cat("OLLCs:", ncol(ollc), "\n"); print(table(ollc$genotype))   # 1,985 cells
+
+## Top 5,000 HVGs within each cell line x technology group, then intersect
+groups <- split(colnames(ollc), paste(ollc$cell_line, ollc$dataset, sep = "_"))
+hvg_per_group <- lapply(groups, function(cells) {
+  obj <- subset(ollc, cells = cells)
+  obj <- NormalizeData(obj, verbose = FALSE)
+  obj <- FindVariableFeatures(obj, nfeatures = 5000, verbose = FALSE)
+  VariableFeatures(obj)
+})
+hvg_intersect_all <- Reduce(intersect, hvg_per_group)
+cat("Shared HVGs:", length(hvg_intersect_all), "\n")           # 1,155 genes
+
+## Shared HVG list (Supplementary Table 6)
+hvg_table <- data.frame(ensembl_id = hvg_intersect_all,
+                        gene_symbol = ens_to_symbol(hvg_intersect_all))
+
+## -----------------------------------------------------------------------------
+## 4. PCA, Harmony (cell line + technology), UMAP, clustering
+## -----------------------------------------------------------------------------
+VariableFeatures(ollc) <- hvg_intersect_all
+ollc <- NormalizeData(ollc, verbose = FALSE)
+ollc <- ScaleData(ollc, features = hvg_intersect_all, verbose = FALSE)
+ollc <- RunPCA(ollc, features = hvg_intersect_all, npcs = 30, verbose = FALSE)
+
+ollc <- RunHarmony(ollc, group.by.vars = c("cell_line", "dataset"),
+                   reduction = "pca", dims.use = 1:15, assay.use = "RNA",
+                   reduction.save = "harmony")
+ollc <- RunUMAP(ollc, reduction = "harmony", dims = 1:15,
+                reduction.name = "umap.harmony_cellline")
+ollc <- FindNeighbors(ollc, reduction = "harmony", dims = 1:15)
+ollc <- FindClusters(ollc, resolution = 0.4, cluster.name = "harmony_cellline_clusters")
+
+Idents(ollc) <- "harmony_cellline_clusters"
+ollc$ollc_cluster <- paste0("OLLC_", ollc$harmony_cellline_clusters)
+
+DimPlot(ollc, reduction = "umap.harmony_cellline", label = TRUE)
+DimPlot(ollc, reduction = "umap.harmony_cellline", group.by = "genotype",
+        cols = c(euploid = "#33679B", trisomic = "#CE4449"))
+
+## -----------------------------------------------------------------------------
+## 5. Composition, marker dot plot, dendrogram
+## -----------------------------------------------------------------------------
+for (v in c("genotype", "cell_line", "dataset", "sex")) {
+  print(prop.table(table(ollc$harmony_cellline_clusters, ollc[[v]][, 1]), margin = 1))
+  print(ggplot(ollc@meta.data, aes(x = harmony_cellline_clusters, fill = .data[[v]])) +
+          geom_bar(position = "fill") +
+          labs(x = "OLLC cluster", y = "Fraction", fill = NULL) +
+          theme_classic())
+}
+
+ollc_markers_dot <- symbol_to_ens(c("MKI67","PCDH15","OLIG1","OLIG2","PDGFRA","ITPR2","SOX10",
+                                    "PTPRZ1","APC","QKI","GPR17","BCAS1","MBP","PLP1"), ollc)
+DotPlot(ollc, features = unname(ollc_markers_dot)) +
+  scale_x_discrete(labels = setNames(names(ollc_markers_dot), ollc_markers_dot)) +
+  RotatedAxis() + labs(x = NULL, y = "Cluster", size = "% Exp", color = "Avg. Exp.")
+
+ollc <- BuildClusterTree(ollc, reduction = "harmony", dims = 1:15)
+PlotClusterTree(ollc)
+
+## -----------------------------------------------------------------------------
+## 6. Cluster markers (Wilcoxon, shared HVGs) and heatmap
+## -----------------------------------------------------------------------------
+ollc_markers <- FindAllMarkers(ollc, features = hvg_intersect_all, only.pos = TRUE,
+                               min.pct = 0.25, test.use = "wilcox")
+ollc_markers$gene_symbol <- ens_to_symbol(ollc_markers$gene)
+ollc_markers$fdr <- p.adjust(ollc_markers$p_val, method = "BH")
+
+specific_markers <- ollc_markers %>%
+  filter(pct.2 < 0.5, avg_log2FC > 0.25) %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC), .by_group = TRUE)
+print(table(specific_markers$cluster))
+
+top_specific <- specific_markers %>% slice_max(order_by = avg_log2FC, n = 10)
+
+ollc <- ScaleData(ollc, features = unique(c(hvg_intersect_all, top_specific$gene)), verbose = FALSE)
+DoHeatmap(ollc, features = top_specific$gene, group.by = "harmony_cellline_clusters",
+          size = 3.5, angle = 0, raster = FALSE) +
+  scale_y_discrete(labels = function(x) setNames(top_specific$gene_symbol, top_specific$gene)[x]) +
+  scale_fill_viridis(option = "magma", name = "Scaled\nExpression") +
+  theme(axis.text.y = element_text(size = 9, face = "italic"))
+
+## -----------------------------------------------------------------------------
+## 7. Per-cluster GSEA (GO BP), one-vs-rest on shared HVGs
+## -----------------------------------------------------------------------------
+gsea_go_results <- list()
+for (cl in levels(Idents(ollc))) {
+  de <- FindMarkers(ollc, ident.1 = cl, features = hvg_intersect_all, only.pos = FALSE,
+                    min.pct = 0, logfc.threshold = 0, test.use = "wilcox")
+  de$gene_symbol <- ens_to_symbol(rownames(de))
+  de <- de %>% filter(!grepl("^ENSG", gene_symbol), !duplicated(gene_symbol))
+
+  ranked <- setNames(de$avg_log2FC, de$gene_symbol)
+  set.seed(42)
+  ranked <- sort(ranked + rnorm(length(ranked), sd = 1e-6), decreasing = TRUE)   # break ties
+
+  gse <- tryCatch(gseGO(geneList = ranked, OrgDb = org.Hs.eg.db, keyType = "SYMBOL", ont = "BP",
+                        minGSSize = 5, maxGSSize = 500, pvalueCutoff = 1, pAdjustMethod = "BH",
+                        eps = 0, nPermSimple = 10000, verbose = FALSE),
+                  error = function(e) NULL)
+  if (is.null(gse)) next
+
+  gsea_go_results[[cl]] <- as.data.frame(gse) %>%
+    filter(p.adjust < 0.05, NES > 0) %>%
+    mutate(cluster = cl)
+}
+gsea_go_all <- bind_rows(gsea_go_results)
+print(table(gsea_go_all$cluster))
+
+top_gsea <- gsea_go_all %>%
+  group_by(cluster) %>%
+  slice_min(order_by = p.adjust, n = 10) %>%
+  ungroup() %>%
+  mutate(neg_log10_padj = -log10(p.adjust),
+         cluster = factor(cluster, levels = sort(unique(as.numeric(cluster)))),
+         Description = str_wrap(Description, width = 45)) %>%
+  arrange(cluster, neg_log10_padj) %>%
+  mutate(term_id = fct_inorder(paste0(cluster, "_", Description)))
+
+ggplot(top_gsea, aes(x = NES, y = term_id, color = cluster)) +
+  geom_segment(aes(x = 0, xend = NES, yend = term_id), linewidth = 0.7, alpha = 0.6) +
+  geom_point(aes(size = neg_log10_padj)) +
+  scale_y_discrete(labels = setNames(top_gsea$Description, top_gsea$term_id)) +
+  scale_color_brewer(palette = "Set2", name = "Cluster") +
+  scale_size_continuous(name = "-log10(padj)", range = c(2, 7)) +
+  labs(x = "Normalized Enrichment Score (NES)", y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.y = element_text(size = 7))
+
+## -----------------------------------------------------------------------------
+## 8. Genotype enrichment per OLLC subcluster
+##    Fisher's exact test (cluster vs all other clusters x trisomic vs euploid),
+##    0.5 pseudocount if any cell is zero, BH correction.
+##    Significant: FDR < 0.05 and (|log2FC| >= 0.5 or |Cohen's h| >= 0.3)
+## -----------------------------------------------------------------------------
+tab <- table(ollc$harmony_cellline_clusters, ollc$genotype)
+N_tri <- sum(tab[, "trisomic"]); N_eu <- sum(tab[, "euploid"])
+
+safe_fisher <- function(a, b, c, d) {
+  M <- matrix(c(a, b, c, d), nrow = 2, byrow = TRUE)
+  if (any(M == 0)) M <- M + 0.5
+  ft <- fisher.test(M)
+  c(or = unname(ft$estimate), p = ft$p.value)
+}
+
+enrich <- tibble(cluster = rownames(tab),
+                 n_tri = as.integer(tab[, "trisomic"]),
+                 n_eu  = as.integer(tab[, "euploid"])) %>%
+  mutate(
+    fisher   = pmap(list(n_tri, N_tri - n_tri, n_eu, N_eu - n_eu), safe_fisher),
+    log2OR   = log2(map_dbl(fisher, "or")),
+    fisher_p = map_dbl(fisher, "p"),
+    fisher_q = p.adjust(fisher_p, method = "BH"),
+    p_tri = n_tri / N_tri, p_eu = n_eu / N_eu,
+    log2FC_prop = log2(((n_tri + 0.5) / (N_tri + 1)) / ((n_eu + 0.5) / (N_eu + 1))),
+    cohen_h  = 2 * asin(sqrt(p_tri)) - 2 * asin(sqrt(p_eu)),
+    direction = ifelse(log2FC_prop > 0, "Trisomic", "Euploid"),
+    significant = fisher_q < 0.05 & (abs(log2FC_prop) >= 0.5 | abs(cohen_h) >= 0.3)
+  ) %>%
+  dplyr::select(-fisher)
+print(enrich, n = Inf)
+
+ggplot(enrich, aes(x = log2FC_prop, y = -log10(fisher_q), color = direction, label = cluster)) +
+  geom_point(size = 6) +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  geom_text_repel(size = 5, max.overlaps = Inf) +
+  scale_color_manual(values = c(Trisomic = "#CE4446", Euploid = "#003366")) +
+  labs(x = "log2 fold-change of proportions (Trisomic vs Euploid)",
+       y = "-log10(FDR)", color = "Direction") +
+  theme_classic(base_size = 20)
+
+## -----------------------------------------------------------------------------
+## Save OLLC object (shared HVGs stored for downstream scripts)
+## -----------------------------------------------------------------------------
+ollc@misc$hvg_intersect_all <- hvg_intersect_all
+save
