@@ -1,0 +1,24 @@
+{
+  "title": "Code for: Trisomy 21 Perturbs Oligodendrocyte Developmental States and Oligo–Neuron Communication in Human Forebrain Assembloids",
+  "description": "Analysis code for single-cell and single-nucleus RNA-seq of euploid and trisomy 21 iPSC-derived forebrain assembloids at 150 days in vitro: quality control, integration, OLLC subclustering, Celda modules, Slingshot pseudotime, scMetaIntegrator differential expression, CellChat and comparison with human fetal and early postnatal reference data.",
+  "upload_type": "software",
+  "license": "MIT",
+  "creators": [
+    {"name": "Baker Campbell, Natalie", "affiliation": "Department of Anatomy & Neurobiology, Boston University Chobanian & Avedisian School of Medicine, Boston University, Boston, MA"},
+    {"name": "Khanna, Sonal", "affiliation": "Department of Anatomy & Neurobiology, Boston University Chobanian & Avedisian School of Medicine, Boston University, Boston, MA; Bioinformatics Program, Boston University, Boston, MA"},
+    {"name": "Kim, Michelle", "affiliation": "Department of Anatomy & Neurobiology, Boston University Chobanian & Avedisian School of Medicine, Boston University, Boston, MA"},
+    {"name": "Kharitonova, Elizabeth K", "affiliation": "Department of Anatomy & Neurobiology, Boston University Chobanian & Avedisian School of Medicine, Boston University, Boston, MA"},
+    {"name": "Weidman, Maya P", "affiliation": "Department of Biomedical Engineering, Boston University, Boston, MA"},
+    {"name": "Headings, Cody", "affiliation": "Department of Computer Sciences, Boston University, Boston, MA"},
+    {"name": "Chung, Clara", "affiliation": "Department of Anatomy & Neurobiology, Boston University Chobanian & Avedisian School of Medicine, Boston University, Boston, MA"},
+    {"name": "Chung, Samantha", "affiliation": "Sargent College of Health and Rehabilitation Sciences, Boston University, Boston, MA"},
+    {"name": "Field, Grace", "affiliation": "Department of Biology, Boston University, Boston, MA"},
+    {"name": "Linetsky, Miriam", "affiliation": "Biochemistry & Molecular Biology (BMB) program, Department of Biology, Department of Chemistry, Boston University, Boston, MA"},
+    {"name": "Thunemann, Martin", "affiliation": "Department of Biomedical Engineering, Boston University, Boston, MA; Neurophotonics Center, Boston University, Boston, MA"},
+    {"name": "Campbell, Joshua", "affiliation": "Department of Medicine, Boston University Chobanian & Avedisian School of Medicine, Boston University, Boston, MA"},
+    {"name": "Medalla, Maria", "affiliation": "Department of Anatomy & Neurobiology, Boston University Chobanian & Avedisian School of Medicine, Boston University, Boston, MA; Center for Systems Neuroscience, Boston University, Boston, MA"},
+    {"name": "Zeldich, Ella", "affiliation": "Department of Anatomy & Neurobiology, Boston University Chobanian & Avedisian School of Medicine, Boston University, Boston, MA; Neurophotonics Center, Boston University, Boston, MA; Center for Systems Neuroscience, Boston University, Boston, MA"}
+  ],
+  "notes": "Natalie Baker Campbell and Sonal Khanna contributed equally. Corresponding authors: Ella Zeldich (ezeldich@bu.edu), Maria Medalla (mmedalla@bu.edu).",
+  "keywords": ["Down syndrome", "trisomy 21", "oligodendrocytes", "forebrain assembloids", "single-cell RNA-seq", "snRNA-seq", "CellChat"]
+}
