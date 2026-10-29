@@ -1,0 +1,55 @@
+## =============================================================================
+## write_session_info.R
+##
+## Records the R version and the versions of all packages used in
+## 01_QC to 09_reference_comparison, and writes them to sessionInfo.txt
+## at the top level of the repository.
+##
+## Run once in the R environment used for the analyses.
+## =============================================================================
+
+out_file <- "sessionInfo.txt"   # run from the repository root
+
+pkgs <- c(
+  ## single-cell framework
+  "Seurat", "SeuratObject", "SingleCellExperiment", "harmony",
+  ## QC
+  "singleCellTK", "scDblFinder", "celda", "DropletUtils",
+  ## composition
+  "speckle", "limma",
+  ## trajectory
+  "slingshot",
+  ## differential expression
+  "scMetaIntegrator", "MetaIntegrator",
+  ## enrichment / annotation
+  "clusterProfiler", "org.Hs.eg.db", "AnnotationDbi", "STRINGdb",
+  ## cell-cell communication
+  "CellChat",
+  ## plotting and data handling
+  "ggplot2", "ggrepel", "ggnewscale", "ggforce", "ggpubr", "patchwork",
+  "pheatmap", "viridis", "RColorBrewer", "dplyr", "tidyr", "purrr",
+  "tibble", "stringr", "forcats", "tidytext", "mgcv", "FNN", "Matrix"
+)
+
+## Load the packages so their versions appear in sessionInfo()
+invisible(lapply(pkgs, function(p) suppressPackageStartupMessages(
+  requireNamespace(p, quietly = TRUE))))
+
+versions <- data.frame(
+  package = pkgs,
+  version = vapply(pkgs, function(p)
+    tryCatch(as.character(packageVersion(p)), error = function(e) "not installed"),
+    character(1)),
+  row.names = NULL
+)
+
+sink(out_file)
+cat("R version:", R.version.string, "\n")
+cat("Platform :", R.version$platform, "\n\n")
+cat("Package versions\n")
+print(versions, row.names = FALSE)
+cat("\n\nFull sessionInfo()\n")
+print(sessionInfo())
+sink()
+
+message("Written: ", out_file)
