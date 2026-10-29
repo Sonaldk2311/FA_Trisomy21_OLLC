@@ -1,0 +1,382 @@
+## =============================================================================
+## 09_reference_comparison.R
+##
+## Comparison of FA cell types and OLLC states with human reference data.
+##
+## DATA AVAILABILITY
+##   Human fetal cortex (DS and control): GEO GSE305146
+##     (GSE305146_seur_integr_labelled_complete_dataset.rda)
+##   Early postnatal human prefrontal cortex (Risgaard et al.): the processed
+##     Seurat objects cannot be redistributed with this repository. Obtain the
+##     data from the original publication / its data repository and create
+##     one Seurat object per genotype (control and Ts21) with the original
+##     author annotations in the metadata columns:
+##       Harmony_subclass_v5 (cell subclass), Age.in.days, disease ("Control" / "Ts21")
+##     Gene names are expected as gene symbols.
+##
+## Input : final annotated object from 04 (day150_final_annotated_seurat.rds)
+##         integrated OLLC object from 04 (ollc_integrated.rds)
+##         Celda module table (module_features.csv, L1-L40) from 05
+##         FA CellChat consensus table from 08 (cellchat_FA_pathway_consensus.rds)
+## Steps
+##   1. Fetal reference: Spearman correlation of cluster-level average
+##      expression (2,000 fetal HVGs, vst) between fetal clusters and FA cell
+##      types (genotypes pooled)
+##   2. Postnatal reference, age-matched alignment: Spearman correlation of
+##      average expression between FA OLLCs and postnatal OPCs + oligodendrocytes
+##      at each age <= 200 days, genotype-matched
+##   3. Module-based reference mapping of postnatal day 60 (control) and
+##      day 65 (Ts21) OPCs + oligodendrocytes onto the six FA OLLC subclusters
+##   4. CellChat in the postnatal reference with module-assigned OLLC states,
+##      compared with the FA matched-pair consensus
+## =============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(AnnotationDbi)
+  library(org.Hs.eg.db)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(ggnewscale)
+  library(pheatmap)
+  library(CellChat)
+})
+
+## -----------------------------------------------------------------------------
+## 0. Settings -- edit these paths
+## -----------------------------------------------------------------------------
+fa_file        <- "/path/to/output/day150_final_annotated_seurat.rds"      # from 04
+ollc_file      <- "/path/to/output/ollc_integrated.rds"                    # from 04
+module_file    <- "/path/to/output/module_features.csv"                    # from 05
+fa_consensus_file <- "/path/to/output/cellchat/cellchat_FA_pathway_consensus.rds"   # from 08
+fetal_rda      <- "/path/to/GSE305146_seur_integr_labelled_complete_dataset.rda"
+risgaard_ctrl_file <- "/path/to/risgaard_control_seurat.rds"   # see DATA AVAILABILITY
+risgaard_ts21_file <- "/path/to/risgaard_ts21_seurat.rds"
+
+set.seed(123456)
+
+## =============================================================================
+## 1. Fetal reference: whole-object correlation
+## =============================================================================
+e <- new.env(); load(fetal_rda, envir = e); seur <- e$seur; rm(e); gc()
+merged <- readRDS(fa_file)
+
+DefaultAssay(seur)   <- "RNA"
+DefaultAssay(merged) <- "RNA"
+seur   <- NormalizeData(seur, verbose = FALSE)
+merged <- NormalizeData(merged, verbose = FALSE)
+
+## 2,000 most variable genes in the fetal reference, mapped to Ensembl IDs
+seur <- FindVariableFeatures(seur, selection.method = "vst", nfeatures = 2000)
+fetal_var_genes <- VariableFeatures(seur, assay = "RNA")
+
+gene_map <- data.frame(Symbol  = fetal_var_genes,
+                       Ensembl = unname(mapIds(org.Hs.eg.db, keys = fetal_var_genes, column = "ENSEMBL",
+                                               keytype = "SYMBOL", multiVals = "first")))
+gene_map <- gene_map[!is.na(gene_map$Ensembl) & gene_map$Ensembl != "", ]
+gene_map <- gene_map[!duplicated(gene_map$Ensembl), ]
+
+merged_genes_clean <- sub("\\..*$", "", rownames(merged))
+common_ensembl  <- intersect(gene_map$Ensembl, merged_genes_clean)
+gene_map_shared <- gene_map[match(common_ensembl, gene_map$Ensembl), ]
+
+## Average expression per fetal cluster (author annotation) and per FA cell type
+Idents(seur)   <- "cluster_name"
+Idents(merged) <- "cell_type"
+fetal_avg <- AverageExpression(seur, assays = "RNA", features = gene_map_shared$Symbol, verbose = FALSE)$RNA
+org_avg   <- AverageExpression(merged, assays = "RNA",
+                               features = rownames(merged)[merged_genes_clean %in% common_ensembl],
+                               verbose = FALSE)$RNA
+
+rownames(fetal_avg) <- gene_map_shared$Ensembl[match(rownames(fetal_avg), gene_map_shared$Symbol)]
+rownames(org_avg)   <- sub("\\..*$", "", rownames(org_avg))
+org_avg <- org_avg[!duplicated(rownames(org_avg)), ]
+
+common_genes <- intersect(rownames(fetal_avg), rownames(org_avg))
+fetal_mat <- as.matrix(fetal_avg[common_genes, , drop = FALSE]); fetal_mat[is.na(fetal_mat)] <- 0
+org_mat   <- as.matrix(org_avg[common_genes, , drop = FALSE]);   org_mat[is.na(org_mat)]     <- 0
+cat("Genes used (fetal):", length(common_genes), "\n")
+
+cor_fetal <- cor(fetal_mat, org_mat, method = "spearman")
+pheatmap(cor_fetal, main = "Correlation: Organoid vs Fetal Cell Types",
+         cluster_rows = FALSE, cluster_cols = FALSE, display_numbers = TRUE, number_format = "%.2f",
+         fontsize_row = 10, fontsize_col = 10,
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(100), border_color = NA)
+
+rm(seur, merged); gc()
+
+## =============================================================================
+## 2. Postnatal reference: age-matched alignment
+##    FA OLLCs (by genotype) vs postnatal OPC + Oligo pooled, per age <= 200
+##    days; genotype-matched (euploid vs Control, trisomic vs Ts21)
+## =============================================================================
+ollc <- readRDS(ollc_file)
+DefaultAssay(ollc) <- "RNA"
+ollc <- JoinLayers(ollc)
+ollc <- NormalizeData(ollc, verbose = FALSE)
+
+euploid_risgaard  <- readRDS(risgaard_ctrl_file)
+trisomic_risgaard <- readRDS(risgaard_ts21_file)
+euploid_risgaard$genotype_source  <- "Euploid"
+trisomic_risgaard$genotype_source <- "Trisomic"
+combined_risgaard_full <- JoinLayers(merge(trisomic_risgaard, euploid_risgaard))
+rm(euploid_risgaard, trisomic_risgaard); gc()
+
+## Ensembl -> symbol helper for FA averages
+to_symbol_rows <- function(avg) {
+  sym <- mapIds(org.Hs.eg.db, keys = sub("\\..*$", "", rownames(avg)), keytype = "ENSEMBL", column = "SYMBOL")
+  avg <- apply(as.matrix(avg), 2, as.numeric); rownames(avg) <- sym
+  avg[!is.na(rownames(avg)) & !duplicated(rownames(avg)), , drop = FALSE]
+}
+
+avg_fa_ollc <- to_symbol_rows(AverageExpression(ollc, group.by = "genotype", assays = "RNA")$RNA)
+
+risgaard_ollc_age <- subset(combined_risgaard_full,
+                            subset = Harmony_subclass_v5 %in% c("Oligo", "OPC") & Age.in.days <= 200)
+risgaard_ollc_age$age_geno <- paste0("d", risgaard_ollc_age$Age.in.days, "_", risgaard_ollc_age$disease)
+print(table(risgaard_ollc_age$Age.in.days, risgaard_ollc_age$disease))
+
+avg_risg_age <- AverageExpression(risgaard_ollc_age, group.by = "age_geno", assays = "RNA")$RNA
+avg_risg_age <- as.matrix(avg_risg_age)
+colnames(avg_risg_age) <- gsub("-", "_", colnames(avg_risg_age))   # AverageExpression may replace "_" with "-"
+
+common_age <- intersect(rownames(avg_fa_ollc), rownames(avg_risg_age))
+keep_age <- common_age[apply(avg_fa_ollc[common_age, ], 1, sd) > 0 &
+                       apply(avg_risg_age[common_age, ], 1, sd) > 0]
+cat("Genes used (age alignment):", length(keep_age), "\n")
+
+cor_age <- cor(avg_fa_ollc[keep_age, ], avg_risg_age[keep_age, ], method = "spearman")
+
+age_df <- as.data.frame(as.table(cor_age)) %>%
+  setNames(c("fa_genotype", "risgaard_group", "correlation")) %>%
+  mutate(risg_age  = as.numeric(sub("^d([0-9]+)_.*$", "\\1", risgaard_group)),
+         risg_geno = sub("^d[0-9]+_", "", risgaard_group)) %>%
+  filter((tolower(fa_genotype) == "trisomic" & risg_geno == "Ts21") |
+         (tolower(fa_genotype) == "euploid"  & risg_geno == "Control"))
+print(age_df)
+
+ggplot(age_df, aes(x = risg_age, y = correlation, color = fa_genotype)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  geom_text(aes(label = risg_age), vjust = -1, size = 3, show.legend = FALSE) +
+  scale_color_manual(values = c(euploid = "#003366", trisomic = "#CE4446")) +
+  labs(x = "Postnatal age (days)", y = "Spearman correlation", color = "FA OLLCs") +
+  theme_minimal()
+
+## =============================================================================
+## 3. Module-based reference mapping
+##    Postnatal OPC + Oligo, control day 60 and Ts21 day 65
+## =============================================================================
+risgaard_oligoopc_6065 <- subset(combined_risgaard_full, subset =
+  (Age.in.days == 60 & disease == "Control" & Harmony_subclass_v5 %in% c("Oligo", "OPC")) |
+  (Age.in.days == 65 & disease == "Ts21"    & Harmony_subclass_v5 %in% c("Oligo", "OPC")))
+print(table(risgaard_oligoopc_6065$Harmony_subclass_v5, risgaard_oligoopc_6065$disease))
+
+## Celda modules (Ensembl -> symbol); modules with >= 5 genes detected
+mod_df <- read.csv(module_file, sep = "\t", stringsAsFactors = FALSE)
+mod_list_sym <- lapply(mod_df, function(x) {
+  genes <- x[x != "" & !is.na(x)]
+  na.omit(unique(mapIds(org.Hs.eg.db, keys = genes, keytype = "ENSEMBL", column = "SYMBOL")))
+})
+names(mod_list_sym) <- colnames(mod_df)
+mod_list_sym <- lapply(mod_list_sym, function(genes) intersect(genes, rownames(risgaard_oligoopc_6065)))
+mod_list_sym <- mod_list_sym[sapply(mod_list_sym, length) >= 5]
+
+risgaard_oligoopc_6065 <- AddModuleScore(risgaard_oligoopc_6065, features = mod_list_sym, name = "Module")
+score_cols <- paste0("Module", seq_along(mod_list_sym))
+colnames(risgaard_oligoopc_6065@meta.data)[colnames(risgaard_oligoopc_6065@meta.data) %in% score_cols] <- names(mod_list_sym)
+risgaard_oligoopc_6065@meta.data <- risgaard_oligoopc_6065@meta.data[, !duplicated(colnames(risgaard_oligoopc_6065@meta.data))]
+
+## OLLC subcluster signatures: five most enriched Celda modules per subcluster,
+## in rank order (from the module enrichment analysis in 05)
+cluster_enrichment <- list(
+  "0" = c("L5",  "L1",  "L22", "L6",  "L23"),
+  "1" = c("L25", "L26", "L34", "L7",  "L36"),
+  "2" = c("L3",  "L5",  "L2",  "L1",  "L4"),
+  "3" = c("L11", "L13", "L15", "L14", "L12"),
+  "4" = c("L16", "L17", "L35", "L21", "L26"),
+  "5" = c("L12", "L14", "L25", "L13", "L36")
+)
+
+## Step 1. Weighted similarity: rank weight (5 -> 1) / number of signatures
+##         containing the module; normalised by the sum of weights
+module_freq        <- table(unlist(cluster_enrichment))
+exclusivity_weight <- 1 / module_freq
+cluster_weights <- lapply(cluster_enrichment, function(mods) {
+  mods_present <- intersect(mods, names(mod_list_sym))
+  rank_w <- rev(seq_along(mods))[mods %in% mods_present]
+  names(rank_w) <- mods_present
+  rank_w * exclusivity_weight[mods_present]
+})
+weighted_scores <- sapply(names(cluster_weights), function(cl) {
+  w <- cluster_weights[[cl]]
+  as.numeric(as.matrix(risgaard_oligoopc_6065@meta.data[, names(w), drop = FALSE]) %*% w) / sum(w)
+})
+colnames(weighted_scores) <- paste0("g", names(cluster_weights))
+
+## Step 2. Standardise each subcluster score across all postnatal cells (genotypes pooled)
+weighted_scores_z <- scale(weighted_scores)
+colnames(weighted_scores_z) <- colnames(weighted_scores)
+
+## Step 3. Assign each cell to the subcluster with the highest standardised score
+risgaard_oligoopc_6065$predicted_weighted_cluster_z <-
+  colnames(weighted_scores_z)[apply(weighted_scores_z, 1, which.max)]
+print(table(risgaard_oligoopc_6065$predicted_weighted_cluster_z, risgaard_oligoopc_6065$disease))
+
+## Step 4. Mean standardised score per genotype (z-score heatmap)
+mean_z <- aggregate(as.data.frame(weighted_scores_z), by = list(genotype = risgaard_oligoopc_6065$disease), FUN = mean)
+mean_z_mat <- as.matrix(mean_z[, -1]); rownames(mean_z_mat) <- mean_z$genotype
+colnames(mean_z_mat) <- paste0("OLLC_", sub("^g", "", colnames(mean_z_mat)))
+pheatmap(mean_z_mat, cluster_rows = FALSE, cluster_cols = FALSE, display_numbers = TRUE, number_format = "%.2f",
+         color = colorRampPalette(c("#2166AC", "white", "#B2182B"))(100),
+         main = "Mean standardised OLLC signature score")
+
+## Step 5. Proportion per genotype; Fisher's exact test per subcluster
+##         (assigned vs not assigned x Ts21 vs Control), BH across subclusters
+prop_df <- risgaard_oligoopc_6065@meta.data %>%
+  count(disease, predicted_weighted_cluster_z) %>%
+  group_by(disease) %>% mutate(prop = n / sum(n)) %>% ungroup()
+
+assign_fisher <- bind_rows(lapply(sort(unique(risgaard_oligoopc_6065$predicted_weighted_cluster_z)), function(cl) {
+  ft <- fisher.test(table(factor(risgaard_oligoopc_6065$disease, levels = c("Ts21", "Control")),
+                          factor(risgaard_oligoopc_6065$predicted_weighted_cluster_z == cl, levels = c(TRUE, FALSE))))
+  data.frame(cluster = cl, odds_ratio_Ts21 = unname(ft$estimate), p_value = ft$p.value)
+})) %>%
+  mutate(fdr = p.adjust(p_value, method = "BH"),
+         enriched_in = ifelse(odds_ratio_Ts21 > 1, "Ts21", "Control"))
+print(assign_fisher)
+
+ggplot(prop_df, aes(x = predicted_weighted_cluster_z, y = prop, fill = disease)) +
+  geom_col(position = position_dodge(width = 0.9)) +
+  geom_text(aes(label = n), position = position_dodge(width = 0.9), vjust = -0.5, size = 3.2) +
+  scale_fill_manual(values = c(Control = "#0B5394", Ts21 = "#990000")) +
+  labs(x = "Assigned OLLC subcluster", y = "Proportion of cells", fill = "Genotype") +
+  theme_minimal()
+
+## UMAP overlay: postnatal cells placed at the centroid of their assigned subcluster
+ollc$lineage_group <- case_when(
+  ollc$harmony_cellline_clusters %in% c("4", "1") ~ "Root (4,1)",
+  ollc$harmony_cellline_clusters %in% c("5", "3") ~ "Trisomic-terminal (5,3)",
+  ollc$harmony_cellline_clusters %in% c("0", "2") ~ "Euploid-terminal (0,2)",
+  TRUE ~ NA_character_
+)
+ollc_umap_df <- as.data.frame(Embeddings(ollc, "umap.harmony_cellline"))
+colnames(ollc_umap_df) <- c("UMAP_1", "UMAP_2")
+ollc_umap_df$cluster_g     <- paste0("g", ollc$harmony_cellline_clusters)
+ollc_umap_df$lineage_group <- ollc$lineage_group
+centroids_cluster <- ollc_umap_df %>% group_by(cluster_g) %>%
+  summarise(UMAP_1 = mean(UMAP_1), UMAP_2 = mean(UMAP_2))
+
+set.seed(123456)
+overlay_df <- data.frame(cluster_g = risgaard_oligoopc_6065$predicted_weighted_cluster_z,
+                         genotype  = risgaard_oligoopc_6065$disease) %>%
+  left_join(centroids_cluster, by = "cluster_g") %>%
+  mutate(UMAP_1 = UMAP_1 + rnorm(n(), 0, 0.4), UMAP_2 = UMAP_2 + rnorm(n(), 0, 0.4))
+
+ggplot() +
+  geom_point(data = filter(ollc_umap_df, !is.na(lineage_group)),
+             aes(x = UMAP_1, y = UMAP_2, color = lineage_group), size = 0.5, alpha = 0.3) +
+  scale_color_manual(values = c("Root (4,1)" = "grey75", "Euploid-terminal (0,2)" = "#A8D8E8",
+                                "Trisomic-terminal (5,3)" = "#F4A8A0"), name = "OLLC Trajectory") +
+  new_scale_color() +
+  geom_point(data = overlay_df, aes(x = UMAP_1, y = UMAP_2, color = genotype), size = 0.8, alpha = 0.6) +
+  scale_color_manual(values = c("Control" = "#0B5394", "Ts21" = "#990000"), name = "Postnatal genotype") +
+  facet_wrap(~ genotype) +
+  theme_minimal() + theme(legend.position = "bottom")
+
+## =============================================================================
+## 4. CellChat in the postnatal reference
+##    Day 60 (control) / day 65 (Ts21) cells; OPC + Oligo labelled by their
+##    assigned OLLC subcluster; all excitatory / inhibitory subclasses grouped
+##    into ExN / InN. Same CellChat settings as the FA analysis.
+## =============================================================================
+cc_obj <- subset(combined_risgaard_full, subset =
+  (Age.in.days == 60 & disease == "Control") | (Age.in.days == 65 & disease == "Ts21"))
+subclass <- as.character(cc_obj$Harmony_subclass_v5)
+cc_group <- case_when(grepl("^ExN", subclass) ~ "ExN",
+                      grepl("^InN", subclass) ~ "InN",
+                      TRUE ~ NA_character_)
+names(cc_group) <- colnames(cc_obj)
+assigned <- risgaard_oligoopc_6065$predicted_weighted_cluster_z
+cc_group[names(assigned)] <- paste0("risgaard_ollc_", sub("^g", "", assigned))
+cc_obj$cc_group <- cc_group
+cc_obj <- subset(cc_obj, cells = names(cc_group)[!is.na(cc_group)])
+print(table(cc_obj$cc_group, cc_obj$disease))
+
+run_cellchat_ref <- function(obj) {
+  data.input <- GetAssayData(obj, assay = "RNA", layer = "data")
+  meta <- data.frame(labels = droplevels(factor(obj$cc_group)), row.names = colnames(obj))
+  cc <- createCellChat(object = data.input, meta = meta, group.by = "labels")
+  cc@DB <- CellChatDB.human
+  cc <- subsetData(cc)
+  cc <- identifyOverExpressedGenes(cc)
+  cc <- identifyOverExpressedInteractions(cc)
+  cc <- computeCommunProb(cc, type = "triMean", population.size = FALSE)
+  cc <- filterCommunication(cc, min.cells = 3)
+  cc <- computeCommunProbPathway(cc)
+  cc <- aggregateNet(cc)
+  cc <- netAnalysis_computeCentrality(cc, slot.name = "netP")
+  cc
+}
+cc_tri <- run_cellchat_ref(subset(cc_obj, subset = disease == "Ts21"))
+cc_eup <- run_cellchat_ref(subset(cc_obj, subset = disease == "Control"))
+
+## Pathway-level communication: OLLC_3 (Ts21) vs OLLC_2 (control);
+## L-R probabilities with p > 0.05 set to 0 and summed per pathway
+get_lr_prob <- function(cc, s, t, thresh = 0.05) {
+  if (!(s %in% rownames(cc@net$prob)) || !(t %in% colnames(cc@net$prob)))
+    return(data.frame(interaction_name = character(0), prob = numeric(0)))
+  p <- cc@net$prob[s, t, ]; pv <- cc@net$pval[s, t, ]
+  p[pv > thresh] <- 0
+  data.frame(interaction_name = names(p), prob = as.numeric(p))
+}
+lr_map <- bind_rows(cc_tri@LR$LRsig, cc_eup@LR$LRsig) %>% distinct(interaction_name, pathway_name)
+
+compare_pathways <- function(s_tri, t_tri, s_eup, t_eup) {
+  full_join(rename(get_lr_prob(cc_tri, s_tri, t_tri), prob_tri = prob),
+            rename(get_lr_prob(cc_eup, s_eup, t_eup), prob_eup = prob), by = "interaction_name") %>%
+    replace_na(list(prob_tri = 0, prob_eup = 0)) %>%
+    left_join(lr_map, by = "interaction_name") %>%
+    filter(prob_tri > 0 | prob_eup > 0) %>%
+    group_by(pathway_name) %>%
+    summarise(n_LR = n(), Trisomic = sum(prob_tri), Euploid = sum(prob_eup), .groups = "drop")
+}
+
+pc <- 1e-6
+postnatal_pathways <- bind_rows(
+  mutate(compare_pathways("ExN", "risgaard_ollc_3", "ExN", "risgaard_ollc_2"), direction = "Neuron_to_OLLC", neuronal_state = "ExN"),
+  mutate(compare_pathways("risgaard_ollc_3", "ExN", "risgaard_ollc_2", "ExN"), direction = "OLLC_to_Neuron", neuronal_state = "ExN"),
+  mutate(compare_pathways("InN", "risgaard_ollc_3", "InN", "risgaard_ollc_2"), direction = "Neuron_to_OLLC", neuronal_state = "InN"),
+  mutate(compare_pathways("risgaard_ollc_3", "InN", "risgaard_ollc_2", "InN"), direction = "OLLC_to_Neuron", neuronal_state = "InN")
+) %>%
+  mutate(log2FC = log2((Trisomic + pc) / (Euploid + pc)),
+         postnatal_direction = case_when(Trisomic > Euploid ~ "T21_ollc3_higher",
+                                         Euploid > Trisomic ~ "Euploid_ollc2_higher",
+                                         TRUE ~ "equal")) %>%
+  rename(pathway = pathway_name)
+
+## Compare with the FA consensus (mature ExN and InN only; postnatal data do not
+## separate immature neurons): concordant / discordant / not detected
+fa_consensus <- readRDS(fa_consensus_file) %>%
+  filter(passes_concordance, neuronal_state %in% c("ExN", "InN"))
+
+concordance <- fa_consensus %>%
+  dplyr::select(direction, pathway, neuronal_state, fa_direction = effect_direction, support_label) %>%
+  left_join(dplyr::select(postnatal_pathways, direction, pathway, neuronal_state,
+                          Trisomic, Euploid, log2FC, postnatal_direction),
+            by = c("direction", "pathway", "neuronal_state")) %>%
+  mutate(status = case_when(is.na(postnatal_direction) ~ "not detected",
+                            postnatal_direction == fa_direction ~ "concordant",
+                            TRUE ~ "discordant"))
+print(concordance, n = Inf)
+print(table(concordance$status))
+
+ggplot(concordance, aes(x = interaction(neuronal_state, direction, sep = " | "), y = pathway, fill = status)) +
+  geom_tile(color = "white") +
+  scale_fill_manual(values = c(concordant = "#4DAF4A", discordant = "#E41A1C", "not detected" = "grey85")) +
+  labs(x = NULL, y = "Pathway", fill = "Postnatal vs FA") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid = element_blank())
+
+sessionInfo()
