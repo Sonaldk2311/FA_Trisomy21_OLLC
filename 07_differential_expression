@@ -1,0 +1,146 @@
+## =============================================================================
+## 07_differential_expression.R
+##
+## Paired single-cell meta-analysis (scMetaIntegrator) of OLLC_3 vs OLLC_2.
+##
+## Input : integrated OLLC object from 04_OLLC_subclustering/
+## Steps
+##   1. OLLC_3 vs OLLC_2: each cell line x technology combination is a pair;
+##      within each pair, cells from each cluster get their own sample ID.
+##      Hedges' g per pair, combined across pairs; Fisher's method for up/down
+##      p values, BH correction.
+##   2. DEGs: genes tested in all pairs with Fisher FDR < 0.05 (up or down)
+##   3. Per-pair effect size distributions of DEGs and DEG count summary
+## =============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(scMetaIntegrator)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(ggplot2)
+  library(AnnotationDbi)
+  library(org.Hs.eg.db)
+})
+
+## -----------------------------------------------------------------------------
+## 0. Settings -- edit these paths
+## -----------------------------------------------------------------------------
+in_file <- "/path/to/output/ollc_integrated.rds"   # from 04
+out_dir <- "/path/to/output"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+set.seed(123456)
+
+ollc <- readRDS(in_file)
+ollc <- JoinLayers(ollc)
+ollc <- NormalizeData(ollc)
+
+## Pair colours (cell line x technology)
+pair_cols <- c("ILD_sc_150" = "#E76F51", "ILD_sn_150" = "#F4A261",
+               "WC_sc_150"  = "#2A9D8F", "WC_sn_150"  = "#8AB17D",
+               "M_sc_150"   = "#264653", "M_sn_150"   = "#457B9D")
+
+## Helpers ---------------------------------------------------------------------
+## DEGs: genes tested in all pairs with Fisher FDR < 0.05 in either direction
+extract_consistent_genes <- function(full_ma_obj, up_label, down_label, fdr_cutoff = 0.05) {
+  pooled <- full_ma_obj$metaAnalysis$pooledResults
+  n_pairs_total <- max(pooled$numPairs, na.rm = TRUE)
+  pooled %>%
+    filter(numPairs == n_pairs_total) %>%
+    filter(fisherFDRUp < fdr_cutoff | fisherFDRDown < fdr_cutoff) %>%
+    mutate(direction = ifelse(fisherFDRUp < fdr_cutoff, up_label, down_label)) %>%
+    arrange(if_else(direction == up_label, fisherFDRUp, fisherFDRDown))
+}
+
+add_gene_symbol <- function(df) {
+  if (nrow(df) == 0) return(df)
+  ens_clean <- sub("\\..*$", "", df$gene)
+  sym_map <- AnnotationDbi::select(org.Hs.eg.db, keys = ens_clean, keytype = "ENSEMBL", columns = "SYMBOL")
+  sym_map <- sym_map[!duplicated(sym_map$ENSEMBL), ]
+  df$gene_symbol <- sym_map$SYMBOL[match(ens_clean, sym_map$ENSEMBL)]
+  df %>% dplyr::select(gene, gene_symbol, direction, everything())
+}
+
+## Per-pair effect sizes (long format)
+extract_pair_effectsizes <- function(full_ma_obj) {
+  as.data.frame(full_ma_obj$metaAnalysis$datasetEffectSizes) %>%
+    rownames_to_column("gene") %>%
+    pivot_longer(cols = -gene, names_to = "Dataset", values_to = "value") %>%
+    filter(!is.na(value))
+}
+
+## Density of per-pair effect sizes for DEGs in one direction
+plot_effect_density <- function(df, title) {
+  ggplot(df, aes(x = value, color = Dataset)) +
+    geom_density(linewidth = 1) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+    scale_color_manual(values = pair_cols) +
+    coord_cartesian(xlim = extendrange(df$value, f = 0.15)) +
+    labs(title = title, subtitle = sprintf("n = %d genes", length(unique(df$gene))),
+         x = "Effect size", y = "Density", color = "Dataset") +
+    theme_bw(base_size = 12)
+}
+
+## =============================================================================
+## 1. scMetaIntegrator: OLLC_3 vs OLLC_2, paired by cell line x technology
+## =============================================================================
+sub_ollc <- subset(ollc, subset = harmony_cellline_clusters %in% c("2", "3"))
+
+sub_ollc$pair_group_cluster <- paste(sub_ollc$cell_line, sub_ollc$dataset, sep = "_")
+sub_ollc$cluster_sample_id  <- paste(sub_ollc$pair_group_cluster,
+                                     sub_ollc$harmony_cellline_clusters, sep = "_cl")   # e.g. ILD_sc_150_cl2
+sub_ollc$cluster_label      <- paste0("cluster", sub_ollc$harmony_cellline_clusters)
+
+confirmPairs(sub_ollc, uniqueSampleID = "cluster_sample_id", pairingColumn = "pair_group_cluster")
+
+cluster_scmi_full_ma <- generateFullMA(
+  sub_ollc,
+  uniqueSampleID        = "cluster_sample_id",
+  pairingColumn         = "pair_group_cluster",
+  comparisonGroupColumn = "cluster_label",
+  groupOne              = "cluster3",
+  groupTwo              = "cluster2",
+  completePairsOnly     = TRUE,
+  assay                 = "RNA"
+)
+
+## =============================================================================
+## 2. DEGs (positive effect size = higher in OLLC_3)
+## =============================================================================
+cluster_degs <- extract_consistent_genes(cluster_scmi_full_ma, "cluster3_up", "cluster3_down") %>%
+  add_gene_symbol() %>%
+  mutate(fdr = if_else(direction == "cluster3_up", fisherFDRUp, fisherFDRDown)) %>%
+  dplyr::select(gene, gene_symbol, direction, effectSize, fdr, everything())
+
+print(table(cluster_degs$direction))
+
+## =============================================================================
+## 3. Per-pair effect sizes of DEGs and DEG counts
+## =============================================================================
+df_joined <- extract_pair_effectsizes(cluster_scmi_full_ma) %>%
+  filter(gene %in% cluster_degs$gene) %>%
+  left_join(dplyr::select(cluster_degs, gene, direction), by = "gene")
+
+plot_effect_density(filter(df_joined, direction == "cluster3_up"),   "Cluster3-UP genes (vs Cluster2)")
+plot_effect_density(filter(df_joined, direction == "cluster3_down"), "Cluster3-DOWN genes (vs Cluster2)")
+
+deg_summary <- cluster_degs %>%
+  count(direction) %>%
+  mutate(direction_label = recode(direction,
+                                  "cluster3_up"   = "Up in Cluster 3",
+                                  "cluster3_down" = "Down in Cluster 3 (Up in Cluster 2)"),
+         n_signed = if_else(direction == "cluster3_up", n, -n))
+
+ggplot(deg_summary, aes(x = direction_label, y = n_signed, fill = direction_label)) +
+  geom_bar(stat = "identity", width = 0.5) +
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.6) +
+  geom_text(aes(label = n, vjust = ifelse(n_signed >= 0, -0.4, 1.2)), size = 5) +
+  scale_fill_manual(values = c("Up in Cluster 3" = "#CE4446",
+                               "Down in Cluster 3 (Up in Cluster 2)" = "#003366")) +
+  labs(x = NULL, y = "Number of DEGs") +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "none")
+
+sessionInfo()
