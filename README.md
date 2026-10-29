@@ -61,13 +61,12 @@ Analyses were run in R 4.4.0 on the Boston University Shared Computing Cluster. 
 - speckle (propeller)
 - ggplot2, dplyr, tidyr, pheatmap, igraph, ggraph, openxlsx
 
-Full package versions are listed in `sessionInfo.txt`.
 
 Upstream processing: Cell Ranger 7.2.0 (scRNA-seq; GRCh38-2024-A) and Cell Ranger ARC 2.0.1 (snRNA-seq, 10x Multiome gene expression; GRCh38).
 
 ## Usage
 
-1. Download the count matrices from GEO (GSE[XXXXXX]) and the reference datasets listed above.
+1. Download the count matrices from GEO (GSE[GSE352389]) and the reference datasets listed above.
 2. Set the data and output paths at the top of each script (`data_dir`, `out_dir`).
 3. Run the folders in numerical order; each script reads the objects saved by the previous step.
 
