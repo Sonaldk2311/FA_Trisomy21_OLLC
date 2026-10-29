@@ -6,7 +6,8 @@ Analysis code accompanying:
 >
 > \*These authors contributed equally.
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.XXXXXXX.svg)](https://doi.org/10.5281/zenodo.XXXXXXX)
+If you use this code, please cite the publication above and the archived version of this repository 
+(Zenodo DOI: [10.5281/zenodo.23776722](https://doi.org/10.5281/zenodo.23776722)).
 
 ---
 
