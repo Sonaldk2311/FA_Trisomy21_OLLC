@@ -27,7 +27,7 @@ We used isogenic euploid and trisomy 21 iPSC-derived forebrain assembloids (FAs)
 
 | Data | Source |
 |---|---|
-| FA scRNA-seq and snRNA-seq (raw FASTQs and Cell Ranger count matrices) | GEO: **[GSE352389] |
+| FA scRNA-seq and snRNA-seq (raw FASTQs and Cell Ranger count matrices) | GEO: **[GSE352389]** |
 | Human fetal cortex reference | GEO: GSE305146 |
 | Early postnatal human prefrontal cortex reference | Risgaard et al. (2026) [accession to be added] |
 
