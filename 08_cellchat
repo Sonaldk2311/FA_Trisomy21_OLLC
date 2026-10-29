@@ -1,0 +1,468 @@
+## =============================================================================
+## 08_cellchat.R
+##
+## CellChat inference of neuron <-> OLLC communication, run per sample, and
+## paired euploid (OLLC_2) vs trisomic (OLLC_3) comparisons across the six
+## matched cell line x technology pairs.
+##
+## Input : final annotated object from 04 (day150_final_annotated_seurat.rds)
+##         integrated OLLC object from 04 (ollc_integrated.rds)
+## Steps
+##   1. Cell labels: OLLCs = OLLC subclusters (ollc_0 - ollc_5); neurons:
+##        Mature ExN   (clusters 0, 1, 3, 6, 11, 13, 15)
+##        Immature ExN (clusters 8, 9, 17)
+##        Mature InN   (clusters 19, 20)
+##        Immature InN (cluster 18)
+##   2. CellChat per sample (CellChatDB.human, full database; log-normalized
+##      RNA; population.size = FALSE; groups with < 3 cells excluded)
+##   3. Discrepancy plots: LR interaction count and total communication
+##      strength, neuron <-> OLLC_2 (euploid) / OLLC_3 (trisomic); medians
+##      across matched pairs for interactions with the same direction of
+##      difference in at least half of the matched pairs
+##   4. Paired pathway log2FC (OLLC_3 / OLLC_2; pseudocount 1e-6), consensus
+##      across matched pairs (same direction in >= 3 pairs), pathway heatmaps
+##   5. Circle plots: median pathway probability across matched pairs
+##   6. L-R bubble plots for selected consensus pathways
+## =============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(CellChat)
+  library(AnnotationDbi)
+  library(org.Hs.eg.db)
+  library(Matrix)
+  library(future)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(ggrepel)
+})
+
+## -----------------------------------------------------------------------------
+## 0. Settings -- edit these paths
+## -----------------------------------------------------------------------------
+entire_file <- "/path/to/output/day150_final_annotated_seurat.rds"   # from 04
+ollc_file   <- "/path/to/output/ollc_integrated.rds"                 # from 04
+cc_dir      <- "/path/to/output/cellchat"                             # per-sample CellChat objects
+dir.create(cc_dir, recursive = TRUE, showWarnings = FALSE)
+
+set.seed(123456)
+plan(sequential)
+
+MIN_CELLS       <- 3      # CellChat filterCommunication
+EPS             <- 1e-6   # pseudocount for log2 fold changes
+MIN_CONCORDANCE <- 3      # matched pairs agreeing in direction (heatmaps, circle and bubble plots)
+
+euploid_ollc  <- "ollc_2"
+trisomic_ollc <- "ollc_3"
+
+neuron_types <- c("ExN", "Immature ExN", "InN", "Immature InN")
+
+## Matched euploid / trisomic pairs
+pairs <- data.frame(
+  pair_id   = c("WC_snuc_150", "M_snuc_150", "ILD_snuc_150", "WC_sc_150", "M_sc_150", "ILD_sc_150"),
+  modality  = c("snuc", "snuc", "snuc", "sc", "sc", "sc"),
+  cell_line = c("WC", "M", "ILD", "WC", "M", "ILD"),
+  euploid   = c("ZE_CN_5", "ZE_CN_7", "ZE_CN_9", "ZE_CN_sc11WCE", "ZE_CN_sc13ME", "ZE_CN_sc15ILDE"),
+  trisomic  = c("ZE_CN_6", "ZE_CN_8", "ZE_CN_10b", "ZE_CN_sc12WCT", "ZE_CN_sc14MT", "ZE_CN_sc16ILDT"),
+  stringsAsFactors = FALSE
+)
+sample_design <- bind_rows(
+  pairs %>% transmute(sample = euploid,  pair_id, cell_line, modality, genotype = "euploid"),
+  pairs %>% transmute(sample = trisomic, pair_id, cell_line, modality, genotype = "trisomic")
+)
+
+## =============================================================================
+## 1. Cell labels
+## =============================================================================
+entire <- readRDS(entire_file)
+ollc   <- readRDS(ollc_file)
+DefaultAssay(entire) <- "RNA"
+entire <- JoinLayers(entire)
+
+neuron_clusters <- c(0, 1, 3, 6, 8, 9, 11, 13, 15, 17, 18, 19, 20)
+ollc_cells <- intersect(colnames(entire), colnames(ollc))
+entire <- subset(entire, cells = union(colnames(entire)[entire$seurat_clusters %in% neuron_clusters],
+                                       ollc_cells))
+
+cl <- as.numeric(as.character(entire$seurat_clusters))
+labels <- case_when(
+  cl %in% c(0, 1, 3, 6, 11, 13, 15) ~ "ExN",
+  cl %in% c(8, 9, 17)               ~ "Immature ExN",
+  cl %in% c(19, 20)                 ~ "InN",
+  cl == 18                          ~ "Immature InN",
+  TRUE                              ~ NA_character_
+)
+names(labels) <- colnames(entire)
+labels[ollc_cells] <- paste0("ollc_", ollc$harmony_cellline_clusters[ollc_cells])
+entire$cellchat_celltypes <- labels
+
+print(table(entire$sample, entire$cellchat_celltypes))
+
+## =============================================================================
+## 2. CellChat per sample
+## =============================================================================
+run_cellchat <- function(obj, min.cells = 3) {
+
+  obj$cellchat_celltypes <- as.character(obj$cellchat_celltypes)
+  Idents(obj) <- "cellchat_celltypes"
+
+  ## Ensembl -> symbol (one symbol per Ensembl ID)
+  ens_ids <- rownames(obj)
+  symbol_map <- AnnotationDbi::select(org.Hs.eg.db, keys = ens_ids, columns = "SYMBOL", keytype = "ENSEMBL")
+  symbol_map <- symbol_map[!is.na(symbol_map$SYMBOL), , drop = FALSE]
+  symbol_map <- symbol_map[!duplicated(symbol_map$ENSEMBL), , drop = FALSE]
+  rownames(symbol_map) <- symbol_map$ENSEMBL
+
+  obj <- subset(obj, features = intersect(ens_ids, rownames(symbol_map)))
+
+  ## Log-normalized expression; Ensembl IDs mapping to the same symbol are summed
+  expr <- GetAssayData(obj, assay = "RNA", layer = "data")
+  rownames(expr) <- symbol_map[rownames(obj), "SYMBOL"]
+  if (anyDuplicated(rownames(expr))) {
+    expr <- rowsum(as.matrix(expr), group = rownames(expr), reorder = FALSE)
+  }
+
+  meta <- obj@meta.data[colnames(expr), , drop = FALSE]
+  meta$samples <- unique(as.character(meta$sample))[1]
+
+  cellchat <- createCellChat(object = expr, meta = meta, group.by = "cellchat_celltypes")
+  cellchat@DB <- CellChatDB.human                    # full database
+  cellchat <- subsetData(cellchat)
+  cellchat <- identifyOverExpressedGenes(cellchat)
+  cellchat <- identifyOverExpressedInteractions(cellchat)
+  cellchat <- computeCommunProb(cellchat, population.size = FALSE)
+  cellchat <- filterCommunication(cellchat, min.cells = min.cells)
+  cellchat@options$min.cells <- min.cells
+  cellchat@options$population.size <- FALSE
+  cellchat <- computeCommunProbPathway(cellchat)
+  cellchat <- aggregateNet(cellchat)
+  cellchat <- netAnalysis_computeCentrality(cellchat)
+  cellchat
+}
+
+for (s in sample_design$sample) {
+  outfile <- file.path(cc_dir, paste0("cellchat_", s, ".rds"))
+  if (file.exists(outfile)) next
+  message("CellChat: ", s)
+  sub_obj <- subset(entire, subset = sample == s)
+  saveRDS(run_cellchat(sub_obj, min.cells = MIN_CELLS), outfile)
+  rm(sub_obj); gc()
+}
+
+read_cc <- function(s) readRDS(file.path(cc_dir, paste0("cellchat_", s, ".rds")))
+chosen_ollc_for <- function(genotype) if (genotype == "euploid") euploid_ollc else trisomic_ollc
+
+## =============================================================================
+## 3. Discrepancy plots
+##    Per sample and neuronal population: number of retained LR interactions
+##    (count) and total inferred communication strength (weight), in both
+##    directions, involving OLLC_2 (euploid samples) or OLLC_3 (trisomic
+##    samples). Interactions with the same direction of difference in
+##    strength in at least half of the matched pairs are summarised by the
+##    median across matched pairs, separately for OLLC_2 and OLLC_3.
+## =============================================================================
+extract_mature_ollc_edges <- function(cc, sample_id, genotype) {
+  weight <- cc@net$weight; count <- cc@net$count
+  chosen <- chosen_ollc_for(genotype)
+  neuron_ids <- intersect(neuron_types, rownames(weight))
+  if (length(neuron_ids) == 0 || !(chosen %in% rownames(weight))) return(NULL)
+  rbind(
+    data.frame(sample = sample_id, genotype = genotype, neuronal_state = neuron_ids,
+               direction = "Neuron_to_OLLC",
+               count = as.numeric(count[neuron_ids, chosen]), weight = as.numeric(weight[neuron_ids, chosen])),
+    data.frame(sample = sample_id, genotype = genotype, neuronal_state = neuron_ids,
+               direction = "OLLC_to_Neuron",
+               count = as.numeric(count[chosen, neuron_ids]), weight = as.numeric(weight[chosen, neuron_ids]))
+  )
+}
+
+count_weight <- bind_rows(lapply(seq_len(nrow(sample_design)), function(i) {
+  extract_mature_ollc_edges(read_cc(sample_design$sample[i]), sample_design$sample[i], sample_design$genotype[i])
+})) %>%
+  left_join(dplyr::select(sample_design, sample, pair_id, genotype), by = c("sample", "genotype"))
+
+## Matched-pair differences (trisomic OLLC_3 - euploid OLLC_2) in strength
+count_weight_paired <- count_weight %>%
+  pivot_wider(id_cols = c(pair_id, direction, neuronal_state),
+              names_from = genotype, values_from = c(count, weight)) %>%
+  filter(!is.na(weight_euploid), !is.na(weight_trisomic)) %>%
+  mutate(diff_weight = weight_trisomic - weight_euploid)
+
+discrepancy_summary <- count_weight_paired %>%
+  group_by(direction, neuronal_state) %>%
+  summarise(n_pairs_tested = n(),
+            n_T21_higher = sum(diff_weight > 0),
+            n_Eu_higher  = sum(diff_weight < 0),
+            median_count_OLLC2  = median(count_euploid),
+            median_count_OLLC3  = median(count_trisomic),
+            median_weight_OLLC2 = median(weight_euploid),
+            median_weight_OLLC3 = median(weight_trisomic),
+            .groups = "drop") %>%
+  mutate(n_consistent = pmax(n_T21_higher, n_Eu_higher),
+         passes_half  = n_consistent >= n_pairs_tested / 2,
+         support_label = paste0(n_consistent, "/", n_pairs_tested))
+print(discrepancy_summary, n = Inf)
+
+discrepancy_plot_df <- discrepancy_summary %>%
+  filter(passes_half) %>%
+  pivot_longer(cols = starts_with("median_"),
+               names_to = c(".value", "ollc_state"),
+               names_pattern = "median_(count|weight)_(OLLC\\d)") %>%
+  mutate(ollc_state = factor(ollc_state, levels = c("OLLC2", "OLLC3"),
+                             labels = c("Euploid: OLLC_2", "Trisomic: OLLC_3")),
+         direction = factor(direction, levels = c("Neuron_to_OLLC", "OLLC_to_Neuron"),
+                            labels = c("Neuron \u2192 OLLC", "OLLC \u2192 neuron")),
+         neuronal_state = factor(neuronal_state, levels = neuron_types))
+
+ggplot(discrepancy_plot_df, aes(x = count, y = weight)) +
+  geom_line(aes(group = neuronal_state), color = "grey55", linewidth = 0.7) +
+  geom_point(aes(color = ollc_state), size = 4) +
+  geom_text_repel(data = filter(discrepancy_plot_df, ollc_state == "Trisomic: OLLC_3"),
+                  aes(label = paste0(neuronal_state, " (", support_label, ")")),
+                  size = 3, color = "black", max.overlaps = Inf, min.segment.length = 0) +
+  facet_wrap(~ direction, scales = "free") +
+  scale_color_manual(values = c("Euploid: OLLC_2" = "#2C7FB8", "Trisomic: OLLC_3" = "#D7301F"),
+                     name = NULL) +
+  labs(x = "Median number of inferred LR interactions",
+       y = "Median total inferred communication strength") +
+  theme_classic(base_size = 13) +
+  theme(strip.background = element_rect(fill = "grey95", color = "grey60"),
+        strip.text = element_text(face = "bold"), legend.position = "bottom")
+
+## =============================================================================
+## 4. Paired pathway comparisons and consensus heatmaps
+## =============================================================================
+## Pathway probability (@netP$prob) between neurons and the genotype-matched
+## OLLC state, in one direction
+extract_pathway_prob <- function(cc, sample_id, genotype, direction, pathways = NULL) {
+  pp <- cc@netP$prob
+  pw_use <- if (is.null(pathways)) dimnames(pp)[[3]] else intersect(dimnames(pp)[[3]], pathways)
+  if (length(pw_use) == 0) return(NULL)
+  chosen <- chosen_ollc_for(genotype)
+  if (direction == "Neuron_to_OLLC") {
+    neurons_present <- intersect(neuron_types, dimnames(pp)[[1]])
+    if (length(neurons_present) == 0 || !(chosen %in% dimnames(pp)[[2]])) return(NULL)
+    edge_array <- pp[neurons_present, chosen, pw_use, drop = FALSE]
+  } else {
+    neurons_present <- intersect(neuron_types, dimnames(pp)[[2]])
+    if (length(neurons_present) == 0 || !(chosen %in% dimnames(pp)[[1]])) return(NULL)
+    edge_array <- pp[chosen, neurons_present, pw_use, drop = FALSE]
+  }
+  df <- expand.grid(neuronal_state = neurons_present, pathway = pw_use, stringsAsFactors = FALSE)
+  df$probability <- as.numeric(edge_array)
+  df$sample <- sample_id; df$genotype <- genotype; df$direction <- direction
+  df
+}
+
+## Paired log2FC (OLLC_3 in trisomic / OLLC_2 in euploid); only where both values exist
+make_paired <- function(edges) {
+  edges %>%
+    left_join(dplyr::select(sample_design, sample, pair_id, cell_line, modality, genotype),
+              by = c("sample", "genotype")) %>%
+    dplyr::select(pair_id, cell_line, modality, direction, pathway, neuronal_state, genotype, probability) %>%
+    pivot_wider(id_cols = c(pair_id, cell_line, modality, direction, pathway, neuronal_state),
+                names_from = genotype, values_from = probability) %>%
+    mutate(log2FC_T21_vs_Eu = ifelse(!is.na(euploid) & !is.na(trisomic),
+                                     log2((trisomic + EPS) / (euploid + EPS)), NA_real_))
+}
+
+## Consensus across matched pairs (zeros count; only missing values excluded)
+make_consensus <- function(paired, min_concordance) {
+  paired %>%
+    filter(!is.na(log2FC_T21_vs_Eu)) %>%
+    group_by(direction, pathway, neuronal_state) %>%
+    summarise(n_pairs_tested = n(),
+              n_T21_higher = sum(log2FC_T21_vs_Eu > 0, na.rm = TRUE),
+              n_Eu_higher  = sum(log2FC_T21_vs_Eu < 0, na.rm = TRUE),
+              median_log2FC_T21_vs_Eu = median(log2FC_T21_vs_Eu, na.rm = TRUE),
+              .groups = "drop") %>%
+    mutate(n_consistent = pmax(n_T21_higher, n_Eu_higher),
+           passes_concordance = n_consistent >= min_concordance,
+           effect_direction = case_when(n_T21_higher > n_Eu_higher ~ "T21_ollc3_higher",
+                                        n_Eu_higher > n_T21_higher ~ "Euploid_ollc2_higher",
+                                        TRUE ~ "mixed"),
+           support_label = paste0(n_consistent, "/", n_pairs_tested),
+           plot_effect = ifelse(passes_concordance, median_log2FC_T21_vs_Eu, NA_real_))
+}
+
+pathway_edges <- bind_rows(lapply(seq_len(nrow(sample_design)), function(i) {
+  cc <- read_cc(sample_design$sample[i])
+  bind_rows(lapply(c("Neuron_to_OLLC", "OLLC_to_Neuron"), function(d)
+    extract_pathway_prob(cc, sample_design$sample[i], sample_design$genotype[i], d)))
+}))
+pathway_paired    <- make_paired(pathway_edges)
+pathway_consensus <- make_consensus(pathway_paired, MIN_CONCORDANCE)
+print(pathway_consensus %>% filter(passes_concordance), n = Inf)
+
+## Heatmap: pathways with >= 1 consensus-supported neuronal population; tiles
+## show median paired log2FC (coloured only when concordant) and support (n/N)
+plot_consensus_heatmap <- function(consensus, dir, y_lab) {
+  df <- filter(consensus, direction == dir)
+  pathway_order <- df %>%
+    filter(passes_concordance) %>%
+    group_by(pathway) %>%
+    summarise(max_abs_effect = max(abs(plot_effect), na.rm = TRUE), .groups = "drop") %>%
+    arrange(desc(max_abs_effect)) %>%
+    pull(pathway)
+  df <- df %>%
+    filter(pathway %in% pathway_order) %>%
+    mutate(pathway = factor(pathway, levels = pathway_order),
+           neuronal_state = factor(neuronal_state, levels = neuron_types))
+  ggplot(df, aes(x = pathway, y = neuronal_state, fill = plot_effect)) +
+    geom_tile(color = "grey80", linewidth = 0.25) +
+    geom_text(aes(label = support_label), size = 3) +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", midpoint = 0, na.value = "grey92",
+                         name = expression("Median paired " * log[2] * "(T21 ollc_3 / Euploid ollc_2)")) +
+    labs(x = "CellChat signaling pathway", y = y_lab) +
+    theme_classic(base_size = 12) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1), axis.ticks = element_blank())
+}
+plot_consensus_heatmap(pathway_consensus, "Neuron_to_OLLC", "Neuronal sender population")
+plot_consensus_heatmap(pathway_consensus, "OLLC_to_Neuron", "Neuronal receiver population")
+
+## =============================================================================
+## 5. Circle plots: median pathway probability across matched pairs
+##    Eu_ollc_2 edges = median euploid probability; T21_ollc_3 edges = median
+##    trisomic probability; only consensus-supported neuronal populations are
+##    drawn, all neuronal populations are kept as nodes.
+## =============================================================================
+circle_summary <- pathway_paired %>%
+  filter(!is.na(euploid), !is.na(trisomic)) %>%
+  group_by(direction, pathway, neuronal_state) %>%
+  summarise(median_Eu_probability  = median(euploid),  median_T21_probability = median(trisomic),
+            IQR_Eu_probability     = IQR(euploid),     IQR_T21_probability    = IQR(trisomic),
+            .groups = "drop") %>%
+  left_join(dplyr::select(pathway_consensus, direction, pathway, neuronal_state, n_pairs_tested,
+                          n_T21_higher, n_Eu_higher, median_log2FC_T21_vs_Eu, support_label, passes_concordance),
+            by = c("direction", "pathway", "neuronal_state"))
+
+plot_nodes  <- c("Eu_ollc_2", "T21_ollc_3", neuron_types)
+node_colors <- c("Eu_ollc_2" = "#2166AC", "T21_ollc_3" = "#B2182B",
+                 setNames(hcl.colors(length(neuron_types), palette = "Dynamic"), neuron_types))
+
+plot_pathway_circle <- function(pw, dir) {
+  tab <- filter(circle_summary, pathway == pw, direction == dir, passes_concordance)
+  net <- matrix(0, length(plot_nodes), length(plot_nodes), dimnames = list(plot_nodes, plot_nodes))
+  for (i in seq_len(nrow(tab))) {
+    n <- tab$neuronal_state[i]
+    if (dir == "Neuron_to_OLLC") {
+      if (tab$median_Eu_probability[i]  > 0) net[n, "Eu_ollc_2"]  <- tab$median_Eu_probability[i]
+      if (tab$median_T21_probability[i] > 0) net[n, "T21_ollc_3"] <- tab$median_T21_probability[i]
+    } else {
+      if (tab$median_Eu_probability[i]  > 0) net["Eu_ollc_2", n]  <- tab$median_Eu_probability[i]
+      if (tab$median_T21_probability[i] > 0) net["T21_ollc_3", n] <- tab$median_T21_probability[i]
+    }
+  }
+  if (sum(net > 0) == 0) return(invisible(NULL))
+  par(mar = c(2, 2, 10, 2), xpd = TRUE)
+  netVisual_circle(net = net, color.use = node_colors[rownames(net)],
+                   title.name = paste0("PATHWAY: ", pw, " (", gsub("_", " ", dir), ")"),
+                   vertex.weight = rep(18, length(plot_nodes)), vertex.weight.max = 18, vertex.size.max = 14,
+                   vertex.label.cex = 0.60, vertex.label.color = "black",
+                   edge.weight.max = max(net), edge.width.max = 10, weight.scale = TRUE,
+                   alpha.edge = 0.72, label.edge = FALSE, edge.curved = 0.20,
+                   arrow.width = 1, arrow.size = 0.24, remove.isolate = FALSE)
+  legend("bottomleft", legend = c("Euploid mature OLLC: ollc_2", "Trisomic mature OLLC: ollc_3"),
+         pch = 21, pt.bg = c("#2166AC", "#B2182B"), pt.cex = 1.7, bty = "n", cex = 0.85)
+}
+
+for (dir in c("OLLC_to_Neuron", "Neuron_to_OLLC")) {
+  pws <- circle_summary %>% filter(direction == dir, passes_concordance) %>% pull(pathway) %>% unique() %>% sort()
+  for (pw in pws) plot_pathway_circle(pw, dir)
+}
+
+## Companion table: evaluable pairs, support, medians, IQRs, median paired log2FC
+circle_edges <- circle_summary %>% filter(passes_concordance) %>% arrange(direction, pathway)
+print(circle_edges, n = Inf)
+
+## =============================================================================
+## 6. L-R bubble plots for selected consensus pathways
+##    For each pathway / direction / neuronal population passing consensus,
+##    all L-R pairs of that pathway are shown, using the values of the OLLC
+##    state with higher pathway-level signaling. L-R values are averaged
+##    across samples.
+## =============================================================================
+selected_pathways <- c("PTN", "EPHB", "NCAM", "CNTN", "NRG", "Glutamate", "PDGF")
+
+get_pathway_map <- function(cc) {
+  lrsig <- if (!is.null(cc@LR$LRsig)) cc@LR$LRsig else cc@DB$interaction
+  data.frame(interaction_name = rownames(lrsig), pathway_name = lrsig$pathway_name,
+             ligand = lrsig$ligand, receptor = lrsig$receptor, stringsAsFactors = FALSE)
+}
+
+extract_lr_edges <- function(cc, sample_id, genotype, direction) {
+  prob <- cc@net$prob; pval <- cc@net$pval
+  pmap <- get_pathway_map(cc)
+  pmap <- pmap[pmap$interaction_name %in% dimnames(prob)[[3]] & pmap$pathway_name %in% selected_pathways, ]
+  chosen <- chosen_ollc_for(genotype)
+  neurons_present <- intersect(neuron_types, dimnames(prob)[[1]])
+  if (nrow(pmap) == 0 || !(chosen %in% dimnames(prob)[[1]]) || length(neurons_present) == 0) return(NULL)
+  bind_rows(lapply(seq_len(nrow(pmap)), function(i) {
+    lr <- pmap$interaction_name[i]
+    if (direction == "Neuron_to_OLLC") {
+      p_vec <- prob[neurons_present, chosen, lr]; pv_vec <- pval[neurons_present, chosen, lr]
+    } else {
+      p_vec <- prob[chosen, neurons_present, lr]; pv_vec <- pval[chosen, neurons_present, lr]
+    }
+    data.frame(sample = sample_id, genotype = genotype, direction = direction,
+               pathway = pmap$pathway_name[i], interaction_name = lr,
+               lr_label = paste0(pmap$ligand[i], " - ", pmap$receptor[i]),
+               neuronal_state = neurons_present,
+               probability = as.numeric(p_vec), pval = as.numeric(pv_vec), stringsAsFactors = FALSE)
+  }))
+}
+
+lr_edges <- bind_rows(lapply(seq_len(nrow(sample_design)), function(i) {
+  cc <- read_cc(sample_design$sample[i])
+  bind_rows(lapply(c("Neuron_to_OLLC", "OLLC_to_Neuron"), function(d)
+    extract_lr_edges(cc, sample_design$sample[i], sample_design$genotype[i], d)))
+}))
+
+lr_final <- lr_edges %>%
+  group_by(direction, pathway, interaction_name, lr_label, neuronal_state, genotype) %>%
+  summarise(mean_prob = mean(probability, na.rm = TRUE), mean_pval = mean(pval, na.rm = TRUE),
+            detection_frac = sum(probability > 0, na.rm = TRUE) / n(), .groups = "drop") %>%
+  pivot_wider(id_cols = c(direction, pathway, interaction_name, lr_label, neuronal_state),
+              names_from = genotype, values_from = c(mean_prob, mean_pval, detection_frac)) %>%
+  inner_join(pathway_consensus %>%
+               filter(passes_concordance, pathway %in% selected_pathways) %>%
+               dplyr::select(direction, pathway, neuronal_state, effect_direction),
+             by = c("direction", "pathway", "neuronal_state")) %>%
+  mutate(eu_wins = effect_direction == "Euploid_ollc2_higher",
+         winning_prob           = ifelse(eu_wins, mean_prob_euploid,      mean_prob_trisomic),
+         winning_pval           = ifelse(eu_wins, mean_pval_euploid,      mean_pval_trisomic),
+         winning_detection_frac = ifelse(eu_wins, detection_frac_euploid, detection_frac_trisomic),
+         neg_log10_p = -log10(pmax(winning_pval, 1e-10)),
+         winning_ollc_label = ifelse(eu_wins, "Eu_ollc_2", "T21_ollc_3"),
+         source_target = ifelse(direction == "Neuron_to_OLLC",
+                                paste0(neuronal_state, " -> ", winning_ollc_label),
+                                paste0(winning_ollc_label, " -> ", neuronal_state))) %>%
+  filter(!is.na(winning_prob), winning_prob > 0)
+
+plot_lr_bubble <- function(df, direction_name, pathway_name) {
+  plot_df <- filter(df, direction == direction_name, pathway == pathway_name)
+  if (nrow(plot_df) == 0) return(invisible(NULL))
+  x_levels <- unique(plot_df$source_target[order(match(plot_df$neuronal_state, neuron_types))])
+  plot_df$source_target <- factor(plot_df$source_target, levels = x_levels)
+  ggplot(plot_df, aes(x = source_target, y = lr_label, color = winning_prob,
+                      size = neg_log10_p, alpha = winning_detection_frac)) +
+    geom_point() +
+    scale_color_gradient(low = "grey85", high = "#B2182B", name = "Communication\nprobability") +
+    scale_size_continuous(name = expression(-log[10](p)), range = c(1.5, 7)) +
+    scale_alpha_continuous(name = "Detected in\n(of matched samples)", range = c(0.35, 1), limits = c(0, 1)) +
+    labs(x = NULL, y = "Ligand - Receptor",
+         title = paste0(pathway_name, " pathway | ", gsub("_", " ", direction_name))) +
+    theme_bw(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid.minor = element_blank(),
+          plot.title = element_text(face = "bold"))
+}
+
+for (d in c("Neuron_to_OLLC", "OLLC_to_Neuron")) {
+  for (pw in selected_pathways) {
+    p <- plot_lr_bubble(lr_final, d, pw)
+    if (!is.null(p)) print(p)
+  }
+}
+
+sessionInfo()
